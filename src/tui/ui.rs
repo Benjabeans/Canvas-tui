@@ -2,7 +2,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, BorderType, Borders, List, ListItem, Paragraph, Row, Table, Tabs, Wrap},
+    widgets::{Block, BorderType, Borders, List, ListItem, Paragraph, Tabs, Wrap},
     Frame,
 };
 
@@ -47,12 +47,44 @@ fn spinner_char(frame: u64) -> &'static str {
     SPINNER[frame as usize % SPINNER.len()]
 }
 
-// ─── Score bar ───────────────────────────────────────────────────────────────
+// ─── Countdown Timer ─────────────────────────────────────────────────────────
 
-/// Render a `width`-char progress bar: `█` filled, `░` empty.
-fn score_bar(score: f64, width: usize) -> String {
-    let filled = ((score.clamp(0.0, 100.0) / 100.0) * width as f64).round() as usize;
-    format!("{}{}", "█".repeat(filled), "░".repeat(width.saturating_sub(filled)))
+/// Returns a human-readable countdown string and a color that progresses from
+/// green (≥7 days) → yellow (1–7 days) → orange (<24h) → red (<6h) → bold red (<1h).
+fn countdown_timer(due: chrono::DateTime<Utc>) -> (String, Color) {
+    let now = Utc::now();
+    let remaining = due.signed_duration_since(now);
+
+    if remaining.num_seconds() <= 0 {
+        return ("Past due".into(), DANGER);
+    }
+
+    let total_mins = remaining.num_minutes();
+    let days = remaining.num_days();
+    let hours = (total_mins / 60) % 24;
+    let mins = total_mins % 60;
+
+    let text = if days > 0 {
+        format!("{days}d {hours}h {mins}m")
+    } else if hours > 0 {
+        format!("{hours}h {mins}m")
+    } else {
+        format!("{mins}m")
+    };
+
+    let color = if days >= 7 {
+        SUCCESS                           // ≥ 1 week — green
+    } else if days >= 3 {
+        Color::Rgb(200, 210, 80)          // 3–7 days — yellow-green
+    } else if days >= 1 {
+        CAUTION                           // 1–3 days — orange/yellow
+    } else if hours >= 6 {
+        Color::Rgb(240, 120, 40)          // 6–24h — deep orange
+    } else {
+        DANGER                            // < 6h — red
+    };
+
+    (text, color)
 }
 
 // ─── Main render ─────────────────────────────────────────────────────────────
@@ -245,99 +277,31 @@ fn render_dashboard(f: &mut Frame, app: &mut App, area: Rect) {
 
     f.render_widget(overview, chunks[0]);
 
-    // ── Bottom split: Grades (left) + Upcoming (right) ────────────────────
+    // ── Bottom split: Upcoming list (left) + Detail (right) ──────────────
     let bottom = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
+        .constraints([Constraint::Percentage(38), Constraint::Percentage(62)])
         .split(chunks[1]);
 
-    render_grades(f, app, bottom[0]);
-    render_upcoming_assignments(f, app, bottom[1]);
+    render_upcoming_assignments(f, app, bottom[0]);
+    render_dashboard_detail(f, app, bottom[1]);
 }
 
-fn render_grades(f: &mut Frame, app: &mut App, area: Rect) {
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(TEXT_MUTED))
-        .title(" Grades ")
-        .title_style(Style::default().fg(AMBER).add_modifier(Modifier::BOLD));
-
-    if app.grades.is_empty() {
-        f.render_widget(
-            Paragraph::new(Line::from(vec![
-                Span::styled("  ○  ", Style::default().fg(TEXT_MUTED)),
-                Span::styled(
-                    "No grade data available",
-                    Style::default().fg(TEXT_DIM),
-                ),
-            ]))
-            .block(block),
-            area,
-        );
-        return;
-    }
-
-    let header = Row::new(vec!["  Course", "Score", "            ", "Grade"])
-        .style(Style::default().fg(AMBER_SOFT).add_modifier(Modifier::BOLD))
-        .bottom_margin(1);
-
-    let rows: Vec<Row> = app
-        .grades
-        .iter()
-        .map(|g| {
-            let score_color = match g.current_score {
-                Some(s) if s >= 90.0 => SUCCESS,
-                Some(s) if s >= 70.0 => CAUTION,
-                Some(_) => DANGER,
-                None => TEXT_DIM,
-            };
-            let score_str = g
-                .current_score
-                .map(|s| format!("{:.1}%", s))
-                .unwrap_or_else(|| "─".into());
-            let bar = g
-                .current_score
-                .map(|s| score_bar(s, 12))
-                .unwrap_or_else(|| "░".repeat(12));
-            let grade_str = g.current_grade.clone().unwrap_or_else(|| "─".into());
-
-            Row::new(vec![
-                format!("  {}", g.course_name),
-                score_str,
-                bar,
-                grade_str,
-            ])
-            .style(Style::default().fg(score_color))
-        })
-        .collect();
-
-    let table = Table::new(
-        rows,
-        [
-            Constraint::Percentage(40),
-            Constraint::Percentage(12),
-            Constraint::Percentage(30),
-            Constraint::Percentage(18),
-        ],
-    )
-    .header(header)
-    .row_highlight_style(Style::default().bg(SEL_BG))
-    .block(block);
-
-    app.grades_table_state.select(Some(app.course_list_state.selected));
-    f.render_stateful_widget(table, area, &mut app.grades_table_state);
-}
-
-fn render_upcoming_assignments(f: &mut Frame, app: &App, area: Rect) {
-    let today = Utc::now().date_naive();
+fn render_upcoming_assignments(f: &mut Frame, app: &mut App, area: Rect) {
+    let now = Utc::now();
+    let today = now.date_naive();
+    let one_month = now + chrono::Duration::days(30);
     let focal_id = app.focal_assignment_id;
 
     let mut upcoming: Vec<(&str, &Assignment)> = app
         .assignments
         .iter()
         .flat_map(|(course, assignments)| assignments.iter().map(move |a| (course.as_str(), a)))
-        .filter(|(_, a)| a.due_at.map(|d| d.date_naive() >= today).unwrap_or(false))
+        .filter(|(_, a)| {
+            a.due_at
+                .map(|d| d.date_naive() >= today && d <= one_month)
+                .unwrap_or(false)
+        })
         .collect();
 
     upcoming.sort_by(|a, b| match (a.1.due_at, b.1.due_at) {
@@ -347,18 +311,28 @@ fn render_upcoming_assignments(f: &mut Frame, app: &App, area: Rect) {
         (Some(x), Some(y)) => x.cmp(&y),
     });
 
+    app.dashboard_list_state.set_len(upcoming.len());
+
     let items: Vec<ListItem> = if upcoming.is_empty() {
         vec![ListItem::new(Line::from(Span::styled(
-            "  ○  Nothing due soon",
+            "  ○  Nothing due in the next 30 days",
             Style::default().fg(TEXT_DIM),
         )))]
     } else {
         upcoming
             .iter()
-            .take(6)
-            .map(|(course_name, a)| {
+            .enumerate()
+            .map(|(idx, (course_name, a))| {
+                let is_selected = idx == app.dashboard_list_state.selected;
                 let is_focal = Some(a.id) == focal_id;
-                let bg = if is_focal { FOCAL_BG } else { Color::Reset };
+
+                let bg = if is_selected {
+                    SEL_BG
+                } else if is_focal {
+                    FOCAL_BG
+                } else {
+                    Color::Reset
+                };
 
                 let name = a.name.as_deref().unwrap_or("Unnamed");
                 let is_today = a.due_at.map(|d| d.date_naive() == today).unwrap_or(false);
@@ -374,14 +348,30 @@ fn render_upcoming_assignments(f: &mut Frame, app: &App, area: Rect) {
                     .unwrap_or_default();
                 let (status, status_color) = assignment_status(a);
 
-                let max_name = 26usize;
-                let name_trunc = if name.len() > max_name {
-                    format!("{}…", &name[..max_name.saturating_sub(1)])
+                let (timer_text, timer_color) = a
+                    .due_at
+                    .map(|d| countdown_timer(d))
+                    .unwrap_or_default();
+
+                // " ▶ " = 3 chars, timer + trailing space
+                let prefix_len = 3;
+                let timer_display = format!(" {} ", timer_text);
+                let timer_len = timer_display.len();
+                let avail = (area.width as usize).saturating_sub(prefix_len + timer_len + 2);
+                let name_trunc = if name.len() > avail {
+                    format!("{}…", &name[..avail.saturating_sub(1)])
                 } else {
                     name.to_string()
                 };
+                let pad = avail.saturating_sub(name_trunc.len());
 
-                let (marker, marker_fg) = if is_focal { ("»", FOCAL) } else { (" ", TEXT_MUTED) };
+                let (marker, marker_fg) = if is_selected {
+                    ("▶", AMBER)
+                } else if is_focal {
+                    ("»", FOCAL)
+                } else {
+                    (" ", TEXT_MUTED)
+                };
 
                 ListItem::new(vec![
                     Line::from(vec![
@@ -394,7 +384,21 @@ fn render_upcoming_assignments(f: &mut Frame, app: &App, area: Rect) {
                             Style::default()
                                 .fg(TEXT)
                                 .bg(bg)
-                                .add_modifier(if is_focal { Modifier::BOLD } else { Modifier::empty() }),
+                                .add_modifier(
+                                    if is_selected || is_focal {
+                                        Modifier::BOLD
+                                    } else {
+                                        Modifier::empty()
+                                    },
+                                ),
+                        ),
+                        Span::styled(
+                            " ".repeat(pad),
+                            Style::default().bg(bg),
+                        ),
+                        Span::styled(
+                            timer_display,
+                            Style::default().fg(timer_color).bg(bg),
                         ),
                     ]),
                     Line::from(vec![
@@ -404,7 +408,13 @@ fn render_upcoming_assignments(f: &mut Frame, app: &App, area: Rect) {
                             Style::default()
                                 .fg(if is_today { CAUTION } else { TEXT_DIM })
                                 .bg(bg)
-                                .add_modifier(if is_today { Modifier::BOLD } else { Modifier::empty() }),
+                                .add_modifier(
+                                    if is_today {
+                                        Modifier::BOLD
+                                    } else {
+                                        Modifier::empty()
+                                    },
+                                ),
                         ),
                         Span::styled(
                             format!(" {}", status),
@@ -428,11 +438,177 @@ fn render_upcoming_assignments(f: &mut Frame, app: &App, area: Rect) {
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(TEXT_MUTED))
-            .title(" Upcoming ")
+            .title(format!(" Upcoming ({}) ", upcoming.len()))
             .title_style(Style::default().fg(AMBER).add_modifier(Modifier::BOLD)),
     );
 
-    f.render_widget(list, area);
+    app.dashboard_list_state
+        .inner
+        .select(Some(app.dashboard_list_state.selected));
+    f.render_stateful_widget(list, area, &mut app.dashboard_list_state.inner);
+}
+
+fn render_dashboard_detail(f: &mut Frame, app: &App, area: Rect) {
+    let detail_block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(TEXT_MUTED))
+        .title(" Assignment Detail ")
+        .title_style(Style::default().fg(AMBER).add_modifier(Modifier::BOLD));
+
+    let Some((course_name, assignment)) = app.get_selected_dashboard_assignment() else {
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "  Select an assignment to view details.",
+                Style::default().fg(TEXT_DIM),
+            )))
+            .block(detail_block),
+            area,
+        );
+        return;
+    };
+
+    let name = assignment.name.as_deref().unwrap_or("Unnamed");
+    let now = Utc::now();
+    let today = now.date_naive();
+
+    let due_str = assignment
+        .due_at
+        .map(|d| {
+            let formatted = d.format("%B %d, %Y at %H:%M").to_string();
+            if d.date_naive() == today {
+                format!("{formatted}  (Today)")
+            } else if d < now {
+                format!("{formatted}  (Past due)")
+            } else {
+                formatted
+            }
+        })
+        .unwrap_or_else(|| "No due date".into());
+
+    let points_str = assignment
+        .points_possible
+        .map(|p| format!("{p} pts"))
+        .unwrap_or_else(|| "─".into());
+
+    let types_str = assignment
+        .submission_types
+        .as_ref()
+        .map(|t| t.join(", "))
+        .unwrap_or_else(|| "─".into());
+
+    let (status, status_color) = assignment_status(assignment);
+
+    let mut lines = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            format!("  {name}"),
+            Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+    ];
+
+    let label_style = Style::default().fg(AMBER_SOFT);
+    let value_style = Style::default().fg(TEXT);
+
+    let fields: Vec<(&str, String, Style)> = {
+        let mut f = vec![
+            ("Course", course_name.to_string(), value_style),
+            ("Due", due_str, value_style),
+            ("Points", points_str, value_style),
+            ("Types", types_str, value_style),
+            ("Status", status.clone(), Style::default().fg(status_color)),
+        ];
+
+        if let Some(ref sub) = assignment.submission {
+            if let Some(score) = sub.score {
+                let pts = assignment.points_possible.unwrap_or(0.0);
+                f.push((
+                    "Score",
+                    format!("{score:.1} / {pts}"),
+                    Style::default().fg(SUCCESS),
+                ));
+            }
+            if let Some(grade) = sub.grade.as_deref() {
+                if sub.score.is_none() {
+                    f.push(("Grade", grade.to_string(), Style::default().fg(SUCCESS)));
+                }
+            }
+            if let Some(submitted) = sub.submitted_at {
+                f.push((
+                    "Submitted",
+                    submitted.format("%B %d, %Y at %H:%M").to_string(),
+                    value_style,
+                ));
+            }
+            if let Some(graded) = sub.graded_at {
+                f.push((
+                    "Graded",
+                    graded.format("%B %d, %Y").to_string(),
+                    value_style,
+                ));
+            }
+            if let Some(attempt) = sub.attempt {
+                f.push(("Attempt", attempt.to_string(), value_style));
+            }
+            if let Some(late) = sub.late {
+                let (text, color) = if late {
+                    ("Yes", DANGER)
+                } else {
+                    ("No", value_style.fg.unwrap_or(TEXT))
+                };
+                f.push(("Late", text.to_string(), Style::default().fg(color)));
+            }
+            if let Some(missing) = sub.missing {
+                if missing {
+                    f.push(("Missing", "Yes".to_string(), Style::default().fg(DANGER)));
+                }
+            }
+        }
+
+        f
+    };
+
+    for (label, value, style) in &fields {
+        lines.push(Line::from(vec![
+            Span::styled(format!("  {:<10}", label), label_style),
+            Span::styled(value.as_str(), *style),
+        ]));
+    }
+
+    if let Some(ref desc) = assignment.description {
+        let stripped = strip_html(desc);
+        if !stripped.trim().is_empty() {
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "  ── Description ──────────────────────────────",
+                Style::default().fg(TEXT_MUTED),
+            )));
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                format!("  {}", stripped.trim()),
+                Style::default().fg(TEXT_DIM),
+            )));
+        }
+    }
+
+    if let Some(ref url) = assignment.html_url {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "  ── Link ─────────────────────────────────────",
+            Style::default().fg(TEXT_MUTED),
+        )));
+        lines.push(Line::from(Span::styled(
+            format!("  {url}"),
+            Style::default().fg(INFO),
+        )));
+    }
+
+    let detail = Paragraph::new(lines)
+        .wrap(Wrap { trim: false })
+        .block(detail_block);
+
+    f.render_widget(detail, area);
 }
 
 // ─── Courses ─────────────────────────────────────────────────────────────────
@@ -546,11 +722,18 @@ fn render_assignments(f: &mut Frame, app: &mut App, area: Rect) {
     let sort_label = app.assignment_sort.label();
     let block_title = format!(" Assignments   s: {} ", sort_label);
 
+    let chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(38), Constraint::Percentage(62)])
+        .split(area);
+
     if app.assignment_sort == AssignmentSort::Course {
-        render_assignments_grouped(f, app, area, &block_title);
+        render_assignments_grouped(f, app, chunks[0], &block_title);
     } else {
-        render_assignments_flat(f, app, area, &block_title);
+        render_assignments_flat(f, app, chunks[0], &block_title);
     }
+
+    render_assignment_detail(f, app, chunks[1]);
 }
 
 fn render_assignments_grouped(f: &mut Frame, app: &mut App, area: Rect, block_title: &str) {
@@ -737,6 +920,169 @@ fn render_assignments_flat(f: &mut Frame, app: &mut App, area: Rect, block_title
         .inner
         .select(Some(app.assignment_list_state.selected));
     f.render_stateful_widget(list, area, &mut app.assignment_list_state.inner);
+}
+
+fn render_assignment_detail(f: &mut Frame, app: &App, area: Rect) {
+    let detail_block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(TEXT_MUTED))
+        .title(" Assignment Detail ")
+        .title_style(Style::default().fg(AMBER).add_modifier(Modifier::BOLD));
+
+    let Some((course_name, assignment)) = app.get_selected_assignment() else {
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "  Select an assignment to view details.",
+                Style::default().fg(TEXT_DIM),
+            )))
+            .block(detail_block),
+            area,
+        );
+        return;
+    };
+
+    let name = assignment.name.as_deref().unwrap_or("Unnamed");
+    let now = Utc::now();
+    let today = now.date_naive();
+
+    // Due date formatting
+    let due_str = assignment
+        .due_at
+        .map(|d| {
+            let formatted = d.format("%B %d, %Y at %H:%M").to_string();
+            if d.date_naive() == today {
+                format!("{formatted}  (Today)")
+            } else if d < now {
+                format!("{formatted}  (Past due)")
+            } else {
+                formatted
+            }
+        })
+        .unwrap_or_else(|| "No due date".into());
+
+    let points_str = assignment
+        .points_possible
+        .map(|p| format!("{p} pts"))
+        .unwrap_or_else(|| "─".into());
+
+    let types_str = assignment
+        .submission_types
+        .as_ref()
+        .map(|t| t.join(", "))
+        .unwrap_or_else(|| "─".into());
+
+    let (status, status_color) = assignment_status(assignment);
+
+    let mut lines = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            format!("  {name}"),
+            Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+    ];
+
+    // Helper to add a label: value row
+    let label_style = Style::default().fg(AMBER_SOFT);
+    let value_style = Style::default().fg(TEXT);
+
+    let fields: Vec<(&str, String, Style)> = {
+        let mut f = vec![
+            ("Course", course_name.to_string(), value_style),
+            ("Due", due_str, value_style),
+            ("Points", points_str, value_style),
+            ("Types", types_str, value_style),
+            ("Status", status.clone(), Style::default().fg(status_color)),
+        ];
+
+        if let Some(ref sub) = assignment.submission {
+            if let Some(score) = sub.score {
+                let pts = assignment.points_possible.unwrap_or(0.0);
+                f.push(("Score", format!("{score:.1} / {pts}"), Style::default().fg(SUCCESS)));
+            }
+            if let Some(grade) = sub.grade.as_deref() {
+                if sub.score.is_none() {
+                    f.push(("Grade", grade.to_string(), Style::default().fg(SUCCESS)));
+                }
+            }
+            if let Some(submitted) = sub.submitted_at {
+                f.push((
+                    "Submitted",
+                    submitted.format("%B %d, %Y at %H:%M").to_string(),
+                    value_style,
+                ));
+            }
+            if let Some(graded) = sub.graded_at {
+                f.push((
+                    "Graded",
+                    graded.format("%B %d, %Y").to_string(),
+                    value_style,
+                ));
+            }
+            if let Some(attempt) = sub.attempt {
+                f.push(("Attempt", attempt.to_string(), value_style));
+            }
+            if let Some(late) = sub.late {
+                let (text, color) = if late {
+                    ("Yes", DANGER)
+                } else {
+                    ("No", value_style.fg.unwrap_or(TEXT))
+                };
+                f.push(("Late", text.to_string(), Style::default().fg(color)));
+            }
+            if let Some(missing) = sub.missing {
+                if missing {
+                    f.push(("Missing", "Yes".to_string(), Style::default().fg(DANGER)));
+                }
+            }
+        }
+
+        f
+    };
+
+    for (label, value, style) in &fields {
+        lines.push(Line::from(vec![
+            Span::styled(format!("  {:<10}", label), label_style),
+            Span::styled(value.as_str(), *style),
+        ]));
+    }
+
+    // Description section
+    if let Some(ref desc) = assignment.description {
+        let stripped = strip_html(desc);
+        if !stripped.trim().is_empty() {
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "  ── Description ──────────────────────────────",
+                Style::default().fg(TEXT_MUTED),
+            )));
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                format!("  {}", stripped.trim()),
+                Style::default().fg(TEXT_DIM),
+            )));
+        }
+    }
+
+    // Link section
+    if let Some(ref url) = assignment.html_url {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "  ── Link ─────────────────────────────────────",
+            Style::default().fg(TEXT_MUTED),
+        )));
+        lines.push(Line::from(Span::styled(
+            format!("  {url}"),
+            Style::default().fg(INFO),
+        )));
+    }
+
+    let detail = Paragraph::new(lines)
+        .wrap(Wrap { trim: false })
+        .block(detail_block);
+
+    f.render_widget(detail, area);
 }
 
 // ─── Calendar ────────────────────────────────────────────────────────────────

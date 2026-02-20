@@ -5,7 +5,7 @@ use crate::api::CanvasClient;
 use crate::cache::{save_cache, CacheData};
 use crate::models::*;
 use chrono::{DateTime, Utc};
-use ratatui::widgets::{ListState as RListState, TableState};
+use ratatui::widgets::ListState as RListState;
 use std::collections::HashSet;
 use tokio::sync::oneshot;
 
@@ -120,7 +120,6 @@ pub struct App {
     // Data
     pub user: Option<User>,
     pub courses: Vec<Course>,
-    pub grades: Vec<CourseGrade>,
     pub assignments: Vec<(String, Vec<Assignment>)>,
     pub calendar_events: Vec<CalendarEvent>,
     pub calendar_items: Vec<CalendarItem>,
@@ -128,13 +127,12 @@ pub struct App {
 
     // UI state
     pub course_list_state: ListState,
-    pub grades_table_state: TableState,
+    pub dashboard_list_state: ListState,
     pub assignment_list_state: ListState,
     pub assignment_sort: AssignmentSort,
     pub focal_assignment_id: Option<u64>,
     pub calendar_list_state: ListState,
     pub announcement_list_state: ListState,
-    pub selected_course_idx: Option<usize>,
 
     // Status
     pub status_message: String,
@@ -199,19 +197,17 @@ impl App {
             active_tab: Tab::Dashboard,
             user: None,
             courses: Vec::new(),
-            grades: Vec::new(),
             assignments: Vec::new(),
             calendar_events: Vec::new(),
             calendar_items: Vec::new(),
             announcements: Vec::new(),
             course_list_state: ListState::new(),
-            grades_table_state: TableState::default(),
+            dashboard_list_state: ListState::new(),
             assignment_list_state: ListState::new(),
             assignment_sort: AssignmentSort::DueDateAsc,
             focal_assignment_id: None,
             calendar_list_state: ListState::new(),
             announcement_list_state: ListState::new(),
-            selected_course_idx: None,
             status_message: "Loading...".into(),
             loading: true,
             needs_refresh: false,
@@ -225,7 +221,6 @@ impl App {
     /// network requests.  After this call the UI is immediately usable.
     pub fn load_from_cache(&mut self, cache: CacheData) {
         self.user = cache.user;
-        self.grades = self.client.extract_grades(&cache.courses);
         self.course_list_state.set_len(cache.courses.len());
         self.courses = cache.courses;
 
@@ -303,7 +298,6 @@ impl App {
 
     fn apply_fetch_result(&mut self, result: FetchResult) {
         self.user = result.user;
-        self.grades = self.client.extract_grades(&result.courses);
         self.course_list_state.set_len(result.courses.len());
         self.courses = result.courses;
 
@@ -512,9 +506,90 @@ impl App {
             .unwrap_or(0)
     }
 
+    /// Returns the course name and assignment reference for the currently
+    /// selected index, resolving correctly across all sort modes (flat and grouped).
+    pub fn get_selected_assignment(&self) -> Option<(&str, &Assignment)> {
+        let mut flat: Vec<(&str, &Assignment)> = self
+            .assignments
+            .iter()
+            .flat_map(|(course, assignments)| {
+                assignments.iter().map(move |a| (course.as_str(), a))
+            })
+            .collect();
+
+        match self.assignment_sort {
+            AssignmentSort::DueDateAsc => flat.sort_by(|a, b| match (a.1.due_at, b.1.due_at) {
+                (None, None) => std::cmp::Ordering::Equal,
+                (None, _) => std::cmp::Ordering::Greater,
+                (_, None) => std::cmp::Ordering::Less,
+                (Some(x), Some(y)) => x.cmp(&y),
+            }),
+            AssignmentSort::DueDateDesc => flat.sort_by(|a, b| match (a.1.due_at, b.1.due_at) {
+                (None, None) => std::cmp::Ordering::Equal,
+                (None, _) => std::cmp::Ordering::Greater,
+                (_, None) => std::cmp::Ordering::Less,
+                (Some(x), Some(y)) => y.cmp(&x),
+            }),
+            AssignmentSort::Status => {
+                flat.sort_by_key(|(_, a)| {
+                    let now = chrono::Utc::now();
+                    if let Some(ref sub) = a.submission {
+                        match sub.workflow_state.as_deref() {
+                            Some("graded") => 4u8,
+                            Some("submitted") => 3,
+                            _ => {
+                                if a.due_at.map_or(false, |d| d < now) {
+                                    if sub.missing.unwrap_or(false) { 0 } else { 1 }
+                                } else {
+                                    2
+                                }
+                            }
+                        }
+                    } else if a.due_at.map_or(false, |d| d < now) {
+                        1
+                    } else {
+                        2
+                    }
+                });
+            }
+            AssignmentSort::Course => { /* already in course order */ }
+        }
+
+        flat.into_iter().nth(self.assignment_list_state.selected)
+    }
+
+    /// Returns the course name and assignment for the currently selected
+    /// dashboard upcoming item.
+    pub fn get_selected_dashboard_assignment(&self) -> Option<(&str, &Assignment)> {
+        let now = chrono::Utc::now();
+        let one_month = now + chrono::Duration::days(30);
+        let today = now.date_naive();
+
+        let mut upcoming: Vec<(&str, &Assignment)> = self
+            .assignments
+            .iter()
+            .flat_map(|(course, assignments)| {
+                assignments.iter().map(move |a| (course.as_str(), a))
+            })
+            .filter(|(_, a)| {
+                a.due_at.map(|d| d.date_naive() >= today && d <= one_month).unwrap_or(false)
+            })
+            .collect();
+
+        upcoming.sort_by(|a, b| match (a.1.due_at, b.1.due_at) {
+            (None, None) => std::cmp::Ordering::Equal,
+            (None, _) => std::cmp::Ordering::Greater,
+            (_, None) => std::cmp::Ordering::Less,
+            (Some(x), Some(y)) => x.cmp(&y),
+        });
+
+        upcoming.into_iter().nth(self.dashboard_list_state.selected)
+    }
+
     pub fn active_list_state_mut(&mut self) -> &mut ListState {
         match self.active_tab {
-            Tab::Dashboard | Tab::Courses => &mut self.course_list_state,
+            Tab::Dashboard => &mut self.dashboard_list_state,
+            Tab::Courses => &mut self.course_list_state,
             Tab::Assignments => &mut self.assignment_list_state,
             Tab::Calendar => &mut self.calendar_list_state,
             Tab::Announcements => &mut self.announcement_list_state,
