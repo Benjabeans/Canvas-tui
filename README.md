@@ -2,7 +2,7 @@
 
 A terminal UI for Canvas LMS. Browse your courses, assignments, calendar, and announcements without leaving the terminal.
 
-![canvas-tui screenshot](https://raw.githubusercontent.com/placeholder/canvas-tui/main/screenshot.png)
+![canvas-tui screenshot](https://github.com/Benjabeans/Canvas-tui/blob/master/screenshot.png)
 
 ---
 
