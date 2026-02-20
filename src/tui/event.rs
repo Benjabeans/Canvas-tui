@@ -12,6 +12,12 @@ pub fn poll_event(timeout: Duration) -> anyhow::Result<Option<Event>> {
 }
 
 pub fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
+    // ── Course filter popup intercepts all keys while open ────────────
+    if app.show_course_filter {
+        handle_filter_key(app, code);
+        return;
+    }
+
     match (code, modifiers) {
         (KeyCode::Char('q'), _) | (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
             app.running = false;
@@ -68,11 +74,39 @@ pub fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
             app.assignment_sort = app.assignment_sort.next();
             app.assignment_list_state.selected = 0;
         }
+        KeyCode::Char('f') if app.active_tab == super::Tab::Assignments => {
+            let count = app.assignment_course_names().len();
+            app.filter_list_state.set_len(count);
+            app.filter_list_state.selected = 0;
+            app.show_course_filter = true;
+        }
         KeyCode::Char('t') => {
             app.jump_to_today_active();
         }
         KeyCode::Char('r') if !app.loading => {
             app.needs_refresh = true;
+        }
+        _ => {}
+    }
+}
+
+fn handle_filter_key(app: &mut App, code: KeyCode) {
+    match code {
+        KeyCode::Down | KeyCode::Char('j') => {
+            app.filter_list_state.select_next();
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            app.filter_list_state.select_prev();
+        }
+        KeyCode::Char(' ') => {
+            let names = app.assignment_course_names();
+            if let Some(name) = names.get(app.filter_list_state.selected) {
+                let name = name.to_string();
+                app.toggle_course_filter(&name);
+            }
+        }
+        KeyCode::Enter | KeyCode::Esc | KeyCode::Char('f') => {
+            app.show_course_filter = false;
         }
         _ => {}
     }

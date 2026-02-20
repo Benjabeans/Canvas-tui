@@ -134,6 +134,11 @@ pub struct App {
     pub calendar_list_state: ListState,
     pub announcement_list_state: ListState,
 
+    // Course filter for assignments tab
+    pub course_filter: HashSet<String>,
+    pub show_course_filter: bool,
+    pub filter_list_state: ListState,
+
     // Status
     pub status_message: String,
     pub loading: bool,
@@ -208,6 +213,9 @@ impl App {
             focal_assignment_id: None,
             calendar_list_state: ListState::new(),
             announcement_list_state: ListState::new(),
+            course_filter: HashSet::new(),
+            show_course_filter: false,
+            filter_list_state: ListState::new(),
             status_message: "Loading...".into(),
             loading: true,
             needs_refresh: false,
@@ -224,9 +232,8 @@ impl App {
         self.course_list_state.set_len(cache.courses.len());
         self.courses = cache.courses;
 
-        let total: usize = cache.assignments.iter().map(|(_, a)| a.len()).sum();
-        self.assignment_list_state.set_len(total);
         self.assignments = cache.assignments;
+        self.recount_filtered_assignments();
 
         self.calendar_events = cache.calendar_events;
 
@@ -301,9 +308,8 @@ impl App {
         self.course_list_state.set_len(result.courses.len());
         self.courses = result.courses;
 
-        let total: usize = result.assignments.iter().map(|(_, a)| a.len()).sum();
-        self.assignment_list_state.set_len(total);
         self.assignments = result.assignments;
+        self.recount_filtered_assignments();
 
         self.calendar_events = result.calendar_events;
         self.announcement_list_state.set_len(result.announcements.len());
@@ -512,6 +518,7 @@ impl App {
         let mut flat: Vec<(&str, &Assignment)> = self
             .assignments
             .iter()
+            .filter(|(name, _)| self.course_passes_filter(name))
             .flat_map(|(course, assignments)| {
                 assignments.iter().map(move |a| (course.as_str(), a))
             })
@@ -556,6 +563,38 @@ impl App {
         }
 
         flat.into_iter().nth(self.assignment_list_state.selected)
+    }
+
+    /// Returns the ordered list of course names that have assignments.
+    pub fn assignment_course_names(&self) -> Vec<&str> {
+        self.assignments.iter().map(|(name, _)| name.as_str()).collect()
+    }
+
+    /// Returns true if the given course name passes the current filter.
+    /// An empty filter set means "show all".
+    pub fn course_passes_filter(&self, course_name: &str) -> bool {
+        self.course_filter.is_empty() || self.course_filter.contains(course_name)
+    }
+
+    /// Toggle a course in the filter set.
+    pub fn toggle_course_filter(&mut self, course_name: &str) {
+        if self.course_filter.contains(course_name) {
+            self.course_filter.remove(course_name);
+        } else {
+            self.course_filter.insert(course_name.to_string());
+        }
+        self.recount_filtered_assignments();
+    }
+
+    /// Recount visible assignments after filter change and clamp selection.
+    pub fn recount_filtered_assignments(&mut self) {
+        let total: usize = self
+            .assignments
+            .iter()
+            .filter(|(name, _)| self.course_passes_filter(name))
+            .map(|(_, a)| a.len())
+            .sum();
+        self.assignment_list_state.set_len(total);
     }
 
     /// Returns the course name and assignment for the currently selected

@@ -2,7 +2,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, BorderType, Borders, List, ListItem, Paragraph, Tabs, Wrap},
+    widgets::{Block, BorderType, Borders, Clear, List, ListItem, Paragraph, Tabs, Wrap},
     Frame,
 };
 
@@ -611,6 +611,93 @@ fn render_dashboard_detail(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(detail, area);
 }
 
+// ─── Course Filter Popup ─────────────────────────────────────────────────────
+
+fn render_course_filter_popup(f: &mut Frame, app: &mut App, area: Rect) {
+    let course_names = app.assignment_course_names();
+    let count = course_names.len();
+    if count == 0 {
+        return;
+    }
+
+    // Size the popup: width based on longest name, height based on item count
+    let max_name_len = course_names.iter().map(|n| n.len()).max().unwrap_or(10);
+    let popup_w = (max_name_len as u16 + 12).min(area.width.saturating_sub(4)); // " [x]  name "
+    let popup_h = ((count as u16) + 4).min(area.height.saturating_sub(2)); // items + border + header + footer
+    let x = area.x + (area.width.saturating_sub(popup_w)) / 2;
+    let y = area.y + (area.height.saturating_sub(popup_h)) / 2;
+    let popup_area = Rect::new(x, y, popup_w, popup_h);
+
+    f.render_widget(Clear, popup_area);
+
+    let items: Vec<ListItem> = course_names
+        .iter()
+        .enumerate()
+        .map(|(i, name)| {
+            let is_selected = i == app.filter_list_state.selected;
+            let enabled = app.course_filter.is_empty() || app.course_filter.contains(*name);
+            let bg = if is_selected { SEL_BG } else { Color::Reset };
+
+            let (marker, marker_fg) = if is_selected {
+                ("▶", AMBER)
+            } else {
+                (" ", TEXT_MUTED)
+            };
+
+            let checkbox = if enabled { "[●]" } else { "[ ]" };
+            let check_color = if enabled { SUCCESS } else { TEXT_MUTED };
+
+            ListItem::new(Line::from(vec![
+                Span::styled(
+                    format!(" {} ", marker),
+                    Style::default().fg(marker_fg).bg(bg),
+                ),
+                Span::styled(
+                    format!("{} ", checkbox),
+                    Style::default().fg(check_color).bg(bg),
+                ),
+                Span::styled(
+                    name.to_string(),
+                    Style::default()
+                        .fg(if enabled { TEXT } else { TEXT_DIM })
+                        .bg(bg)
+                        .add_modifier(if is_selected {
+                            Modifier::BOLD
+                        } else {
+                            Modifier::empty()
+                        }),
+                ),
+            ]))
+        })
+        .collect();
+
+    let filter_label = if app.course_filter.is_empty() {
+        "all".to_string()
+    } else {
+        format!("{}/{}", app.course_filter.len(), count)
+    };
+
+    let list = List::new(items).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(AMBER_SOFT))
+            .title(format!(" Filter Courses ({}) ", filter_label))
+            .title_style(Style::default().fg(AMBER).add_modifier(Modifier::BOLD))
+            .title_bottom(Line::from(vec![
+                Span::styled(" space", Style::default().fg(AMBER_SOFT)),
+                Span::styled(" toggle  ", Style::default().fg(TEXT_DIM)),
+                Span::styled("enter/esc", Style::default().fg(AMBER_SOFT)),
+                Span::styled(" close ", Style::default().fg(TEXT_DIM)),
+            ])),
+    );
+
+    app.filter_list_state
+        .inner
+        .select(Some(app.filter_list_state.selected));
+    f.render_stateful_widget(list, popup_area, &mut app.filter_list_state.inner);
+}
+
 // ─── Courses ─────────────────────────────────────────────────────────────────
 
 fn render_courses(f: &mut Frame, app: &mut App, area: Rect) {
@@ -720,7 +807,13 @@ fn assignment_status_priority(a: &Assignment) -> u8 {
 
 fn render_assignments(f: &mut Frame, app: &mut App, area: Rect) {
     let sort_label = app.assignment_sort.label();
-    let block_title = format!(" Assignments   s: {} ", sort_label);
+    let filter_hint = if app.course_filter.is_empty() {
+        String::new()
+    } else {
+        format!("  filter: {} course{}", app.course_filter.len(),
+            if app.course_filter.len() == 1 { "" } else { "s" })
+    };
+    let block_title = format!(" Assignments   s: {}   f: filter{} ", sort_label, filter_hint);
 
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
@@ -734,6 +827,10 @@ fn render_assignments(f: &mut Frame, app: &mut App, area: Rect) {
     }
 
     render_assignment_detail(f, app, chunks[1]);
+
+    if app.show_course_filter {
+        render_course_filter_popup(f, app, area);
+    }
 }
 
 fn render_assignments_grouped(f: &mut Frame, app: &mut App, area: Rect, block_title: &str) {
@@ -742,7 +839,7 @@ fn render_assignments_grouped(f: &mut Frame, app: &mut App, area: Rect, block_ti
     let mut flat_idx = 0usize;
     let mut selected_item_idx = 0usize;
 
-    for (course_name, assignments) in &app.assignments {
+    for (course_name, assignments) in app.assignments.iter().filter(|(name, _)| app.course_passes_filter(name)) {
         items.push(ListItem::new(Line::from(vec![
             Span::styled(" ◈  ", Style::default().fg(AMBER_SOFT)),
             Span::styled(
@@ -834,6 +931,7 @@ fn render_assignments_flat(f: &mut Frame, app: &mut App, area: Rect, block_title
     let mut flat: Vec<(&str, &Assignment)> = app
         .assignments
         .iter()
+        .filter(|(name, _)| app.course_passes_filter(name))
         .flat_map(|(course, assignments)| assignments.iter().map(move |a| (course.as_str(), a)))
         .collect();
 
