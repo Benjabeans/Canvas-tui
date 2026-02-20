@@ -81,20 +81,18 @@ async fn run_app(
 ) -> Result<()> {
     let mut app = App::new(client);
 
-    // Show cached data instantly while fresh data loads in the background.
+    // Show cached data instantly, then kick off a background sync.
     if let Some(cached) = cache::load_cache() {
         app.load_from_cache(cached);
-        terminal.draw(|f| tui::ui::render(f, &mut app))?;
-        app.status_message = "Syncing fresh data…".into();
-        app.loading = true;
-        terminal.draw(|f| tui::ui::render(f, &mut app))?;
+        app.start_fetch();
+        app.status_message = "Showing cached data — syncing in background…".into();
     } else {
-        terminal.draw(|f| tui::ui::render(f, &mut app))?;
+        app.start_fetch();
     }
-
-    app.load_initial_data().await;
+    terminal.draw(|f| tui::ui::render(f, &mut app))?;
 
     loop {
+        app.frame_count = app.frame_count.wrapping_add(1);
         terminal.draw(|f| tui::ui::render(f, &mut app))?;
 
         if let Some(event) = tui::event::poll_event(Duration::from_millis(100))? {
@@ -110,12 +108,12 @@ async fn run_app(
             break;
         }
 
+        // Apply completed fetch results without blocking.
+        app.poll_fetch_result();
+
         if app.needs_refresh {
             app.needs_refresh = false;
-            app.loading = true;
-            app.status_message = "Refreshing…".into();
-            terminal.draw(|f| tui::ui::render(f, &mut app))?;
-            app.load_initial_data().await;
+            app.start_fetch();
         }
     }
 

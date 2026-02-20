@@ -7,6 +7,7 @@ use crate::models::*;
 use chrono::{DateTime, Utc};
 use ratatui::widgets::{ListState as RListState, TableState};
 use std::collections::HashSet;
+use tokio::sync::oneshot;
 
 // ─── Assignment Sort ─────────────────────────────────────────────────────────
 
@@ -36,6 +37,19 @@ impl AssignmentSort {
             Self::Status => "Status",
         }
     }
+}
+
+// ─── Background Fetch Result ─────────────────────────────────────────────────
+
+pub struct FetchResult {
+    pub user: Option<User>,
+    pub courses: Vec<Course>,
+    pub assignments: Vec<(String, Vec<Assignment>)>,
+    pub calendar_events: Vec<CalendarEvent>,
+    pub announcements: Vec<DiscussionTopic>,
+    pub fetched_at: DateTime<Utc>,
+    /// Non-fatal error message to show in the status bar.
+    pub error: Option<String>,
 }
 
 // ─── Calendar Item ───────────────────────────────────────────────────────────
@@ -127,6 +141,12 @@ pub struct App {
     pub loading: bool,
     pub needs_refresh: bool,
     pub cached_at: Option<DateTime<Utc>>,
+
+    // Background fetch channel
+    pub fetch_rx: Option<oneshot::Receiver<FetchResult>>,
+
+    // Incremented each frame; used to drive the loading spinner.
+    pub frame_count: u64,
 }
 
 /// Tracks logical selection plus a persistent ratatui scroll offset.
@@ -196,6 +216,8 @@ impl App {
             loading: true,
             needs_refresh: false,
             cached_at: None,
+            fetch_rx: None,
+            frame_count: 0,
         }
     }
 
@@ -242,121 +264,86 @@ impl App {
         );
     }
 
-    pub async fn load_initial_data(&mut self) {
-        self.status_message = "Fetching profile...".into();
-
-        match self.client.get_self().await {
-            Ok(user) => self.user = Some(user),
-            Err(e) => {
-                self.status_message = format!("Error fetching profile: {e}");
-                self.loading = false;
-                return;
-            }
+    /// Spawn a background task that fetches all Canvas data without blocking
+    /// the event loop.  Call `poll_fetch_result` each frame to collect the
+    /// result once the task finishes.  No-ops if a fetch is already running.
+    pub fn start_fetch(&mut self) {
+        if self.fetch_rx.is_some() {
+            return;
         }
+        let client = self.client.clone();
+        let (tx, rx) = oneshot::channel();
+        self.fetch_rx = Some(rx);
+        self.loading = true;
+        self.status_message = "Syncing in background…".into();
+        tokio::spawn(async move {
+            let result = fetch_canvas_data(client).await;
+            let _ = tx.send(result);
+        });
+    }
 
-        self.status_message = "Fetching courses...".into();
-        match self.client.list_courses().await {
-            Ok(courses) => {
-                self.grades = self.client.extract_grades(&courses);
-                self.course_list_state.set_len(courses.len());
-                self.courses = courses;
-            }
-            Err(e) => {
-                self.status_message = format!("Error fetching courses: {e}");
-                self.loading = false;
-                return;
-            }
-        }
-
-        self.status_message = "Fetching assignments...".into();
-        self.assignments.clear();
-        for course in &self.courses {
-            let name = course.name.clone().unwrap_or_else(|| "Unnamed".into());
-            match self.client.list_assignments(course.id, true).await {
-                Ok(assignments) => {
-                    if !assignments.is_empty() {
-                        self.assignments.push((name, assignments));
-                    }
+    /// Check the background fetch channel without blocking.  Returns `true`
+    /// and applies the result to app state when data has arrived.
+    pub fn poll_fetch_result(&mut self) -> bool {
+        let result = match self.fetch_rx.as_mut() {
+            None => return false,
+            Some(rx) => match rx.try_recv() {
+                Ok(r) => r,
+                Err(oneshot::error::TryRecvError::Empty) => return false,
+                Err(oneshot::error::TryRecvError::Closed) => {
+                    self.fetch_rx = None;
+                    return false;
                 }
-                Err(_) => continue,
-            }
-        }
-        let total_assignments: usize = self.assignments.iter().map(|(_, a)| a.len()).sum();
-        self.assignment_list_state.set_len(total_assignments);
+            },
+        };
+        self.fetch_rx = None;
+        self.apply_fetch_result(result);
+        true
+    }
 
-        self.status_message = "Fetching calendar...".into();
-        let now = chrono::Utc::now();
-        let start = now.format("%Y-%m-%d").to_string();
-        let end = (now + chrono::Duration::days(30))
-            .format("%Y-%m-%d")
-            .to_string();
-        let context_codes: Vec<String> = self
-            .courses
-            .iter()
-            .map(|c| format!("course_{}", c.id))
-            .collect();
+    fn apply_fetch_result(&mut self, result: FetchResult) {
+        self.user = result.user;
+        self.grades = self.client.extract_grades(&result.courses);
+        self.course_list_state.set_len(result.courses.len());
+        self.courses = result.courses;
 
-        if let Ok(mut events) = self
-            .client
-            .list_calendar_events(&context_codes, &start, &end)
-            .await
-        {
-            if let Ok(deadlines) = self
-                .client
-                .list_upcoming_events(&context_codes, &start, &end)
-                .await
-            {
-                events.extend(deadlines);
-            }
-            events.sort_by(|a, b| a.start_at.cmp(&b.start_at));
-            self.calendar_events = events;
-        }
+        let total: usize = result.assignments.iter().map(|(_, a)| a.len()).sum();
+        self.assignment_list_state.set_len(total);
+        self.assignments = result.assignments;
 
-        self.status_message = "Fetching announcements...".into();
-        if let Ok(announcements) = self.client.list_announcements(&context_codes).await {
-            self.announcement_list_state.set_len(announcements.len());
-            self.announcements = announcements;
-        }
+        self.calendar_events = result.calendar_events;
+        self.announcement_list_state.set_len(result.announcements.len());
+        self.announcements = result.announcements;
 
         self.rebuild_calendar_items();
         self.focal_assignment_id = self.compute_focal_assignment_id();
 
-        // Persist fresh data to the on-disk cache.
-        let now = Utc::now();
-        let cache = CacheData {
-            cached_at: now,
-            user: self.user.clone(),
-            courses: self.courses.clone(),
-            assignments: self.assignments.clone(),
-            calendar_events: self.calendar_events.clone(),
-            announcements: self.announcements.clone(),
-        };
-        if let Err(e) = save_cache(&cache) {
-            // Non-fatal: warn in the status bar but continue.
-            self.status_message = format!("Warning: could not save cache: {e}");
-        }
-        self.cached_at = Some(now);
-
-        // Auto-position both lists to today's date.
         let cal_idx = self.find_today_calendar_idx();
         self.calendar_list_state.selected = cal_idx;
         let asgn_idx = self.find_today_assignment_idx();
         self.assignment_list_state.selected = asgn_idx;
 
+        self.cached_at = Some(result.fetched_at);
         self.loading = false;
-        let name = self
-            .user
-            .as_ref()
-            .and_then(|u| u.name.clone())
-            .unwrap_or_else(|| "Student".into());
-        let synced = now
-            .with_timezone(&chrono::Local)
-            .format("%b %d %H:%M");
-        self.status_message = format!(
-            "Welcome, {}! {} courses loaded. Synced {synced}.",
-            name,
-            self.courses.len()
-        );
+
+        if let Some(err) = result.error {
+            self.status_message = format!("Sync error: {err}");
+        } else {
+            let name = self
+                .user
+                .as_ref()
+                .and_then(|u| u.name.clone())
+                .unwrap_or_else(|| "Student".into());
+            let synced = result
+                .fetched_at
+                .with_timezone(&chrono::Local)
+                .format("%b %d %H:%M");
+            self.status_message = format!(
+                "Welcome, {}! {} courses loaded. Synced {synced}.",
+                name,
+                self.courses.len()
+            );
+        }
     }
 
     pub fn rebuild_calendar_items(&mut self) {
@@ -533,4 +520,89 @@ impl App {
             Tab::Announcements => &mut self.announcement_list_state,
         }
     }
+}
+
+// ─── Background fetch (runs in a spawned task) ───────────────────────────────
+
+async fn fetch_canvas_data(client: CanvasClient) -> FetchResult {
+    let mut result = FetchResult {
+        user: None,
+        courses: Vec::new(),
+        assignments: Vec::new(),
+        calendar_events: Vec::new(),
+        announcements: Vec::new(),
+        fetched_at: Utc::now(),
+        error: None,
+    };
+
+    match client.get_self().await {
+        Ok(user) => result.user = Some(user),
+        Err(e) => {
+            result.error = Some(format!("fetching profile: {e}"));
+            return result;
+        }
+    }
+
+    match client.list_courses().await {
+        Ok(courses) => result.courses = courses,
+        Err(e) => {
+            result.error = Some(format!("fetching courses: {e}"));
+            return result;
+        }
+    }
+
+    for course in &result.courses {
+        let name = course.name.clone().unwrap_or_else(|| "Unnamed".into());
+        if let Ok(assignments) = client.list_assignments(course.id, true).await {
+            if !assignments.is_empty() {
+                result.assignments.push((name, assignments));
+            }
+        }
+    }
+
+    let now = Utc::now();
+    let start = now.format("%Y-%m-%d").to_string();
+    let end = (now + chrono::Duration::days(30))
+        .format("%Y-%m-%d")
+        .to_string();
+    let context_codes: Vec<String> = result
+        .courses
+        .iter()
+        .map(|c| format!("course_{}", c.id))
+        .collect();
+
+    if let Ok(mut events) = client
+        .list_calendar_events(&context_codes, &start, &end)
+        .await
+    {
+        if let Ok(deadlines) = client
+            .list_upcoming_events(&context_codes, &start, &end)
+            .await
+        {
+            events.extend(deadlines);
+        }
+        events.sort_by(|a, b| a.start_at.cmp(&b.start_at));
+        result.calendar_events = events;
+    }
+
+    if let Ok(announcements) = client.list_announcements(&context_codes).await {
+        result.announcements = announcements;
+    }
+
+    result.fetched_at = Utc::now();
+
+    // Save cache from within the background task so the main thread never blocks.
+    let cache = CacheData {
+        cached_at: result.fetched_at,
+        user: result.user.clone(),
+        courses: result.courses.clone(),
+        assignments: result.assignments.clone(),
+        calendar_events: result.calendar_events.clone(),
+        announcements: result.announcements.clone(),
+    };
+    if let Err(e) = save_cache(&cache) {
+        result.error = Some(format!("saving cache: {e}"));
+    }
+
+    result
 }
