@@ -179,6 +179,12 @@ fn render_dashboard(f: &mut Frame, app: &mut App, area: Rect) {
     );
     f.render_widget(summary, chunks[0]);
 
+    let bottom = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
+        .split(chunks[1]);
+
+    // ── Grades (left) ────────────────────────────────────────────────────
     if app.grades.is_empty() {
         let msg = Paragraph::new(
             "  No grade data available (you may not be enrolled as a student)",
@@ -189,7 +195,7 @@ fn render_dashboard(f: &mut Frame, app: &mut App, area: Rect) {
                 .title(" Grades ")
                 .title_style(Style::default().fg(ACCENT)),
         );
-        f.render_widget(msg, chunks[1]);
+        f.render_widget(msg, bottom[0]);
     } else {
         let header =
             Row::new(vec!["Course", "Score", "Grade", "Final Score", "Final Grade"])
@@ -241,8 +247,122 @@ fn render_dashboard(f: &mut Frame, app: &mut App, area: Rect) {
         );
 
         app.grades_table_state.select(Some(app.course_list_state.selected));
-        f.render_stateful_widget(table, chunks[1], &mut app.grades_table_state);
+        f.render_stateful_widget(table, bottom[0], &mut app.grades_table_state);
     }
+
+    // ── Upcoming Assignments (right) ─────────────────────────────────────
+    render_upcoming_assignments(f, app, bottom[1]);
+}
+
+fn render_upcoming_assignments(f: &mut Frame, app: &App, area: Rect) {
+    let now = Utc::now();
+    let today = now.date_naive();
+    let focal_id = app.focal_assignment_id;
+
+    // Collect and sort all assignments by due date, then take the 6 soonest
+    // that are due today or later.
+    let mut upcoming: Vec<(&str, &Assignment)> = app
+        .assignments
+        .iter()
+        .flat_map(|(course, assignments)| {
+            assignments.iter().map(move |a| (course.as_str(), a))
+        })
+        .filter(|(_, a)| {
+            a.due_at
+                .map(|d| d.date_naive() >= today)
+                .unwrap_or(false)
+        })
+        .collect();
+
+    upcoming.sort_by(|a, b| match (a.1.due_at, b.1.due_at) {
+        (None, None) => std::cmp::Ordering::Equal,
+        (None, _) => std::cmp::Ordering::Greater,
+        (_, None) => std::cmp::Ordering::Less,
+        (Some(x), Some(y)) => x.cmp(&y),
+    });
+
+    let items: Vec<ListItem> = if upcoming.is_empty() {
+        vec![ListItem::new(Line::from(Span::styled(
+            "  No upcoming assignments",
+            Style::default().fg(DIM),
+        )))]
+    } else {
+        upcoming
+            .iter()
+            .take(6)
+            .map(|(course_name, assignment)| {
+                let is_focal = Some(assignment.id) == focal_id;
+
+                let name = assignment.name.as_deref().unwrap_or("Unnamed");
+                let due = assignment
+                    .due_at
+                    .map(|d| {
+                        if d.date_naive() == today {
+                            format!("Today {}", d.format("%H:%M"))
+                        } else {
+                            d.format("%b %d").to_string()
+                        }
+                    })
+                    .unwrap_or_default();
+
+                let (status, status_color) = assignment_status(assignment);
+
+                let (marker, marker_color) = if is_focal {
+                    ("» ", FOCAL)
+                } else {
+                    ("  ", DIM)
+                };
+                let bg = if is_focal { FOCAL_BG } else { Color::Reset };
+
+                // Truncate name to fit the panel width comfortably.
+                let max_name = 24usize;
+                let name_trunc = if name.len() > max_name {
+                    format!("{}…", &name[..max_name.saturating_sub(1)])
+                } else {
+                    name.to_string()
+                };
+
+                let name_style = Style::default()
+                    .fg(Color::White)
+                    .bg(bg)
+                    .add_modifier(if is_focal { Modifier::BOLD } else { Modifier::empty() });
+
+                ListItem::new(vec![
+                    Line::from(vec![
+                        Span::styled(marker, Style::default().fg(marker_color).bg(bg)),
+                        Span::styled(name_trunc, name_style),
+                    ]),
+                    Line::from(vec![
+                        Span::styled("    ", Style::default().bg(bg)),
+                        Span::styled(
+                            format!("{due:<14}"),
+                            Style::default().fg(if due.starts_with("Today") { WARN } else { DIM }).bg(bg),
+                        ),
+                        Span::styled(
+                            format!(" {status}"),
+                            Style::default().fg(status_color).bg(bg),
+                        ),
+                    ]),
+                    Line::from(vec![
+                        Span::styled("    ", Style::default().bg(bg)),
+                        Span::styled(
+                            course_name.to_string(),
+                            Style::default().fg(DIM).bg(bg),
+                        ),
+                    ]),
+                ])
+            })
+            .collect()
+    };
+
+    let list = List::new(items).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(" Upcoming Assignments ")
+            .title_style(Style::default().fg(ACCENT)),
+    );
+
+    f.render_widget(list, area);
 }
 
 // ─── Courses ────────────────────────────────────────────────────────────────
