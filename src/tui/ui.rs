@@ -6,9 +6,10 @@ use ratatui::{
     Frame,
 };
 
-use super::{App, AssignmentSort, Tab};
+use super::{App, AssignmentSort, CalendarItem, SubmissionState, Tab, UnifiedViewMode};
 use crate::models::Assignment;
-use chrono::{Local, Utc};
+use chrono::{Datelike, Local, NaiveDate, Utc};
+use std::collections::BTreeMap;
 
 // ─── Palette ─────────────────────────────────────────────────────────────────
 
@@ -105,8 +106,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
     match app.active_tab {
         Tab::Dashboard => render_dashboard(f, app, chunks[1]),
         Tab::Courses => render_courses(f, app, chunks[1]),
-        Tab::Assignments => render_assignments(f, app, chunks[1]),
-        Tab::Calendar => render_calendar(f, app, chunks[1]),
+        Tab::Assignments => render_schedule(f, app, chunks[1]),
         Tab::Announcements => render_announcements(f, app, chunks[1]),
     }
 
@@ -188,6 +188,21 @@ fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
         ("●", SUCCESS)
     };
 
+    let hints = if app.submission_state.is_hidden() {
+        let nav = match (app.active_tab, app.unified_view_mode) {
+            (Tab::Assignments, UnifiedViewMode::CalendarView) =>
+                "   │   q quit   Tab switch   j/k nav   v list-view   Enter submit   t today   r refresh",
+            (Tab::Assignments, UnifiedViewMode::ListView) =>
+                "   │   q quit   Tab switch   j/k nav   v cal-view   s sort   f filter   Enter submit   r refresh",
+            _ =>
+                "   │   q quit   Tab switch   j/k nav   r refresh",
+        };
+        format!("{}{}  ", nav, sync_hint)
+    } else {
+        "   │   j/k navigate   Space/Enter select   Esc back   y confirm   n cancel  "
+            .to_string()
+    };
+
     let bar = Paragraph::new(Line::from(vec![
         Span::styled(
             format!(" {} ", indicator),
@@ -197,13 +212,7 @@ fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
             app.status_message.as_str(),
             Style::default().fg(TEXT).bg(HDR_BG),
         ),
-        Span::styled(
-            format!(
-                "   │   q quit   Tab switch   j/k nav   s sort   t today   r refresh{}  ",
-                sync_hint
-            ),
-            Style::default().fg(TEXT_MUTED).bg(HDR_BG),
-        ),
+        Span::styled(hints, Style::default().fg(TEXT_MUTED).bg(HDR_BG)),
     ]))
     .style(Style::default().bg(HDR_BG));
 
@@ -611,6 +620,362 @@ fn render_dashboard_detail(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(detail, area);
 }
 
+// ─── Submission Modal ─────────────────────────────────────────────────────────
+
+fn render_submission_modal(f: &mut Frame, app: &mut App, area: Rect) {
+    match &app.submission_state {
+        SubmissionState::TypePicker => render_type_picker(f, app, area),
+        SubmissionState::UrlInput => render_text_input_modal(
+            f,
+            area,
+            " Submit URL ",
+            "Enter the URL to submit:",
+            &app.submission_input,
+            "Enter to confirm  ·  Esc to go back",
+        ),
+        SubmissionState::FileInput => render_text_input_modal(
+            f,
+            area,
+            " Submit File ",
+            "Enter the full file path:",
+            &app.submission_input,
+            "Enter to confirm  ·  Esc to go back",
+        ),
+        SubmissionState::TextPreview => render_text_preview(f, app, area),
+        SubmissionState::Confirming => render_confirm_modal(f, app, area),
+        SubmissionState::Submitting => render_submitting_modal(f, app, area),
+        SubmissionState::Done { success, message } => {
+            render_done_modal(f, area, *success, message.clone())
+        }
+        SubmissionState::Hidden => {}
+    }
+}
+
+fn popup_rect(width: u16, height: u16, area: Rect) -> Rect {
+    let w = width.min(area.width.saturating_sub(4));
+    let h = height.min(area.height.saturating_sub(2));
+    Rect::new(
+        area.x + (area.width.saturating_sub(w)) / 2,
+        area.y + (area.height.saturating_sub(h)) / 2,
+        w,
+        h,
+    )
+}
+
+fn render_type_picker(f: &mut Frame, app: &mut App, area: Rect) {
+    let kinds = &app.submission_supported_kinds;
+    let h = (kinds.len() as u16 + 6).min(area.height.saturating_sub(2));
+    let w = 54u16.min(area.width.saturating_sub(4));
+    let popup = popup_rect(w, h, area);
+
+    f.render_widget(Clear, popup);
+
+    let items: Vec<ListItem> = kinds
+        .iter()
+        .enumerate()
+        .map(|(i, kind)| {
+            let is_sel = i == app.submission_cursor;
+            let bg = if is_sel { SEL_BG } else { Color::Reset };
+            let (marker, mfg) = if is_sel { ("▶", AMBER) } else { (" ", TEXT_MUTED) };
+            ListItem::new(Line::from(vec![
+                Span::styled(
+                    format!(" {marker} "),
+                    Style::default().fg(mfg).bg(bg),
+                ),
+                Span::styled(
+                    kind.label(),
+                    Style::default()
+                        .fg(if is_sel { TEXT } else { TEXT_DIM })
+                        .bg(bg)
+                        .add_modifier(if is_sel { Modifier::BOLD } else { Modifier::empty() }),
+                ),
+            ]))
+        })
+        .collect();
+
+    let mut state = app.filter_list_state.inner.clone();
+    state.select(Some(app.submission_cursor));
+
+    let list = List::new(items).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(AMBER_SOFT))
+            .title(" Submit Assignment ")
+            .title_style(Style::default().fg(AMBER).add_modifier(Modifier::BOLD))
+            .title_bottom(Line::from(vec![
+                Span::styled(" j/k ", Style::default().fg(AMBER_SOFT)),
+                Span::styled("move  ", Style::default().fg(TEXT_DIM)),
+                Span::styled("Enter ", Style::default().fg(AMBER_SOFT)),
+                Span::styled("select  ", Style::default().fg(TEXT_DIM)),
+                Span::styled("Esc ", Style::default().fg(AMBER_SOFT)),
+                Span::styled("cancel ", Style::default().fg(TEXT_DIM)),
+            ])),
+    );
+
+    f.render_stateful_widget(list, popup, &mut state);
+}
+
+fn render_text_input_modal(
+    f: &mut Frame,
+    area: Rect,
+    title: &str,
+    prompt: &str,
+    input: &str,
+    footer: &str,
+) {
+    let popup = popup_rect(70, 8, area);
+    f.render_widget(Clear, popup);
+
+    // Truncate from the left if input is too wide for the box
+    let inner_w = popup.width.saturating_sub(4) as usize;
+    let display = if input.len() > inner_w {
+        format!("…{}", &input[input.len().saturating_sub(inner_w - 1)..])
+    } else {
+        input.to_string()
+    };
+    let cursor_line = format!("{display}_");
+
+    let para = Paragraph::new(vec![
+        Line::from(""),
+        Line::from(Span::styled(prompt, Style::default().fg(TEXT_DIM))),
+        Line::from(""),
+        Line::from(Span::styled(cursor_line, Style::default().fg(TEXT).add_modifier(Modifier::BOLD))),
+    ])
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(AMBER_SOFT))
+            .title(title)
+            .title_style(Style::default().fg(AMBER).add_modifier(Modifier::BOLD))
+            .title_bottom(Line::from(Span::styled(
+                format!(" {footer} "),
+                Style::default().fg(TEXT_DIM),
+            ))),
+    );
+
+    f.render_widget(para, popup);
+}
+
+fn render_text_preview(f: &mut Frame, app: &App, area: Rect) {
+    let popup = popup_rect(72, 22, area);
+    f.render_widget(Clear, popup);
+
+    let content = &app.submission_input;
+    let inner_w = popup.width.saturating_sub(4) as usize;
+    let max_lines = popup.height.saturating_sub(8) as usize;
+
+    let preview_lines: Vec<Line> = content
+        .lines()
+        .take(max_lines)
+        .map(|l| {
+            let truncated = if l.len() > inner_w {
+                format!("{}…", &l[..inner_w.saturating_sub(1)])
+            } else {
+                l.to_string()
+            };
+            Line::from(Span::styled(
+                format!("  {truncated}"),
+                Style::default().fg(TEXT_DIM),
+            ))
+        })
+        .collect();
+
+    let total_lines = content.lines().count();
+    let truncation_note = if total_lines > max_lines {
+        format!("  … ({} more lines not shown)", total_lines - max_lines)
+    } else {
+        String::new()
+    };
+
+    let mut lines = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            "  Preview of text to submit:",
+            Style::default().fg(AMBER_SOFT),
+        )),
+        Line::from(Span::styled(
+            "  ──────────────────────────────────────────────────────────",
+            Style::default().fg(TEXT_MUTED),
+        )),
+    ];
+    lines.extend(preview_lines);
+    if !truncation_note.is_empty() {
+        lines.push(Line::from(Span::styled(
+            truncation_note,
+            Style::default().fg(TEXT_MUTED),
+        )));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "  ──────────────────────────────────────────────────────────",
+        Style::default().fg(TEXT_MUTED),
+    )));
+    lines.push(Line::from(vec![
+        Span::styled("  Submit this text?  ", Style::default().fg(TEXT)),
+        Span::styled("y ", Style::default().fg(SUCCESS).add_modifier(Modifier::BOLD)),
+        Span::styled("yes  ", Style::default().fg(TEXT_DIM)),
+        Span::styled("n ", Style::default().fg(DANGER).add_modifier(Modifier::BOLD)),
+        Span::styled("no / re-edit", Style::default().fg(TEXT_DIM)),
+    ]));
+
+    let para = Paragraph::new(lines)
+        .wrap(Wrap { trim: false })
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(AMBER_SOFT))
+                .title(" Text Entry — Confirm Submission ")
+                .title_style(Style::default().fg(AMBER).add_modifier(Modifier::BOLD)),
+        );
+
+    f.render_widget(para, popup);
+}
+
+fn render_confirm_modal(f: &mut Frame, app: &App, area: Rect) {
+    let popup = popup_rect(66, 12, area);
+    f.render_widget(Clear, popup);
+
+    let kind_label = match &app.submission_kind {
+        Some(k) => k.label(),
+        None => "Unknown",
+    };
+
+    let inner_w = popup.width.saturating_sub(6) as usize;
+    let display_input = if app.submission_input.len() > inner_w {
+        format!("…{}", &app.submission_input[app.submission_input.len().saturating_sub(inner_w - 1)..])
+    } else {
+        app.submission_input.clone()
+    };
+
+    let lines = vec![
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  Type    ", Style::default().fg(AMBER_SOFT)),
+            Span::styled(kind_label, Style::default().fg(TEXT)),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  Content ", Style::default().fg(AMBER_SOFT)),
+            Span::styled(display_input, Style::default().fg(TEXT).add_modifier(Modifier::BOLD)),
+        ]),
+        Line::from(""),
+        Line::from(Span::styled(
+            "  ────────────────────────────────────────────────────────",
+            Style::default().fg(TEXT_MUTED),
+        )),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  Submit this?  ", Style::default().fg(TEXT)),
+            Span::styled("y ", Style::default().fg(SUCCESS).add_modifier(Modifier::BOLD)),
+            Span::styled("yes  ", Style::default().fg(TEXT_DIM)),
+            Span::styled("n ", Style::default().fg(DANGER).add_modifier(Modifier::BOLD)),
+            Span::styled("no / go back", Style::default().fg(TEXT_DIM)),
+        ]),
+    ];
+
+    let para = Paragraph::new(lines)
+        .wrap(Wrap { trim: false })
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(AMBER_SOFT))
+                .title(" Confirm Submission ")
+                .title_style(Style::default().fg(AMBER).add_modifier(Modifier::BOLD)),
+        );
+
+    f.render_widget(para, popup);
+}
+
+fn render_submitting_modal(f: &mut Frame, app: &App, area: Rect) {
+    let popup = popup_rect(40, 5, area);
+    f.render_widget(Clear, popup);
+
+    let spin = spinner_char(app.frame_count);
+    let para = Paragraph::new(vec![
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(format!("  {spin}  "), Style::default().fg(CAUTION)),
+            Span::styled("Submitting…", Style::default().fg(TEXT).add_modifier(Modifier::BOLD)),
+        ]),
+    ])
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(CAUTION))
+            .title(" Submitting ")
+            .title_style(Style::default().fg(AMBER).add_modifier(Modifier::BOLD)),
+    );
+
+    f.render_widget(para, popup);
+}
+
+fn render_done_modal(f: &mut Frame, area: Rect, success: bool, message: String) {
+    let popup = popup_rect(62, 7, area);
+    f.render_widget(Clear, popup);
+
+    let (icon, border_color, msg_color) = if success {
+        ("✓", SUCCESS, SUCCESS)
+    } else {
+        ("✗", DANGER, DANGER)
+    };
+
+    let inner_w = popup.width.saturating_sub(6) as usize;
+    let wrapped: Vec<Line> = message
+        .chars()
+        .collect::<String>()
+        .as_str()
+        .chars()
+        .collect::<Vec<_>>()
+        .chunks(inner_w)
+        .map(|chunk| {
+            Line::from(Span::styled(
+                format!("  {}", chunk.iter().collect::<String>()),
+                Style::default().fg(msg_color),
+            ))
+        })
+        .collect();
+
+    let mut lines = vec![
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(format!("  {icon}  "), Style::default().fg(border_color).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                if success { "Done" } else { "Error" },
+                Style::default().fg(border_color).add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(""),
+    ];
+    lines.extend(wrapped);
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "  Press any key to close",
+        Style::default().fg(TEXT_MUTED),
+    )));
+
+    let para = Paragraph::new(lines)
+        .wrap(Wrap { trim: false })
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(border_color))
+                .title(if success { " Submitted " } else { " Submission Failed " })
+                .title_style(
+                    Style::default()
+                        .fg(border_color)
+                        .add_modifier(Modifier::BOLD),
+                ),
+        );
+
+    f.render_widget(para, popup);
+}
+
 // ─── Course Filter Popup ─────────────────────────────────────────────────────
 
 fn render_course_filter_popup(f: &mut Frame, app: &mut App, area: Rect) {
@@ -751,6 +1116,70 @@ fn render_courses(f: &mut Frame, app: &mut App, area: Rect) {
     f.render_stateful_widget(list, area, &mut app.course_list_state.inner);
 }
 
+// ─── Schedule (unified Calendar + Assignments) ────────────────────────────────
+
+fn render_schedule(f: &mut Frame, app: &mut App, area: Rect) {
+    match app.unified_view_mode {
+        UnifiedViewMode::CalendarView => render_schedule_calendar(f, app, area),
+        UnifiedViewMode::ListView => render_schedule_list(f, app, area),
+    }
+}
+
+fn render_schedule_calendar(f: &mut Frame, app: &mut App, area: Rect) {
+    let chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(42), Constraint::Percentage(58)])
+        .split(area);
+
+    render_calendar_list(f, app, chunks[0]);
+    render_schedule_calendar_detail(f, app, chunks[1]);
+
+    if app.show_course_filter {
+        render_course_filter_popup(f, app, area);
+    }
+    if !app.submission_state.is_hidden() {
+        render_submission_modal(f, app, area);
+    }
+}
+
+fn render_schedule_calendar_detail(f: &mut Frame, app: &App, area: Rect) {
+    let detail_block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(TEXT_MUTED))
+        .title(" Detail ")
+        .title_style(Style::default().fg(AMBER).add_modifier(Modifier::BOLD));
+
+    let Some(item) = app.calendar_items.get(app.calendar_list_state.selected) else {
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "  Select an item to view details.",
+                Style::default().fg(TEXT_DIM),
+            )))
+            .block(detail_block),
+            area,
+        );
+        return;
+    };
+
+    // If this CalendarItem is linked to an assignment, show full assignment detail.
+    if let Some(assignment_id) = item.assignment_id {
+        if let Some((course_name, assignment)) = app.get_assignment_by_id(assignment_id) {
+            let asgn_block = Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(TEXT_MUTED))
+                .title(" Assignment Detail ")
+                .title_style(Style::default().fg(AMBER).add_modifier(Modifier::BOLD));
+            render_assignment_detail_for(f, area, asgn_block, course_name, assignment);
+            return;
+        }
+    }
+
+    // Fallback: lightweight calendar event detail.
+    render_calendar_event_detail(f, area, detail_block, item);
+}
+
 // ─── Assignments ─────────────────────────────────────────────────────────────
 
 fn assignment_status(a: &Assignment) -> (String, Color) {
@@ -805,7 +1234,7 @@ fn assignment_status_priority(a: &Assignment) -> u8 {
     }
 }
 
-fn render_assignments(f: &mut Frame, app: &mut App, area: Rect) {
+fn render_schedule_list(f: &mut Frame, app: &mut App, area: Rect) {
     let sort_label = app.assignment_sort.label();
     let filter_hint = if app.course_filter.is_empty() {
         String::new()
@@ -813,7 +1242,7 @@ fn render_assignments(f: &mut Frame, app: &mut App, area: Rect) {
         format!("  filter: {} course{}", app.course_filter.len(),
             if app.course_filter.len() == 1 { "" } else { "s" })
     };
-    let block_title = format!(" Assignments   s: {}   f: filter{} ", sort_label, filter_hint);
+    let block_title = format!(" Schedule [List]   s: {}   f: filter{}   v: calendar ", sort_label, filter_hint);
 
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
@@ -830,6 +1259,10 @@ fn render_assignments(f: &mut Frame, app: &mut App, area: Rect) {
 
     if app.show_course_filter {
         render_course_filter_popup(f, app, area);
+    }
+
+    if !app.submission_state.is_hidden() {
+        render_submission_modal(f, app, area);
     }
 }
 
@@ -1040,11 +1473,23 @@ fn render_assignment_detail(f: &mut Frame, app: &App, area: Rect) {
         return;
     };
 
+    render_assignment_detail_for(f, area, detail_block, course_name, assignment);
+}
+
+/// Shared assignment detail renderer. Accepts pre-fetched data so it can be
+/// called from both the list view and the calendar view (where the selected
+/// item is a CalendarItem backed by an assignment).
+fn render_assignment_detail_for<'a>(
+    f: &mut Frame,
+    area: Rect,
+    detail_block: Block<'a>,
+    course_name: &str,
+    assignment: &crate::models::Assignment,
+) {
     let name = assignment.name.as_deref().unwrap_or("Unnamed");
     let now = Utc::now();
     let today = now.date_naive();
 
-    // Due date formatting
     let due_str = assignment
         .due_at
         .map(|d| {
@@ -1081,12 +1526,11 @@ fn render_assignment_detail(f: &mut Frame, app: &App, area: Rect) {
         Line::from(""),
     ];
 
-    // Helper to add a label: value row
     let label_style = Style::default().fg(AMBER_SOFT);
     let value_style = Style::default().fg(TEXT);
 
     let fields: Vec<(&str, String, Style)> = {
-        let mut f = vec![
+        let mut flds = vec![
             ("Course", course_name.to_string(), value_style),
             ("Due", due_str, value_style),
             ("Points", points_str, value_style),
@@ -1097,29 +1541,29 @@ fn render_assignment_detail(f: &mut Frame, app: &App, area: Rect) {
         if let Some(ref sub) = assignment.submission {
             if let Some(score) = sub.score {
                 let pts = assignment.points_possible.unwrap_or(0.0);
-                f.push(("Score", format!("{score:.1} / {pts}"), Style::default().fg(SUCCESS)));
+                flds.push(("Score", format!("{score:.1} / {pts}"), Style::default().fg(SUCCESS)));
             }
             if let Some(grade) = sub.grade.as_deref() {
                 if sub.score.is_none() {
-                    f.push(("Grade", grade.to_string(), Style::default().fg(SUCCESS)));
+                    flds.push(("Grade", grade.to_string(), Style::default().fg(SUCCESS)));
                 }
             }
             if let Some(submitted) = sub.submitted_at {
-                f.push((
+                flds.push((
                     "Submitted",
                     submitted.format("%B %d, %Y at %H:%M").to_string(),
                     value_style,
                 ));
             }
             if let Some(graded) = sub.graded_at {
-                f.push((
+                flds.push((
                     "Graded",
                     graded.format("%B %d, %Y").to_string(),
                     value_style,
                 ));
             }
             if let Some(attempt) = sub.attempt {
-                f.push(("Attempt", attempt.to_string(), value_style));
+                flds.push(("Attempt", attempt.to_string(), value_style));
             }
             if let Some(late) = sub.late {
                 let (text, color) = if late {
@@ -1127,16 +1571,16 @@ fn render_assignment_detail(f: &mut Frame, app: &App, area: Rect) {
                 } else {
                     ("No", value_style.fg.unwrap_or(TEXT))
                 };
-                f.push(("Late", text.to_string(), Style::default().fg(color)));
+                flds.push(("Late", text.to_string(), Style::default().fg(color)));
             }
             if let Some(missing) = sub.missing {
                 if missing {
-                    f.push(("Missing", "Yes".to_string(), Style::default().fg(DANGER)));
+                    flds.push(("Missing", "Yes".to_string(), Style::default().fg(DANGER)));
                 }
             }
         }
 
-        f
+        flds
     };
 
     for (label, value, style) in &fields {
@@ -1146,7 +1590,6 @@ fn render_assignment_detail(f: &mut Frame, app: &App, area: Rect) {
         ]));
     }
 
-    // Description section
     if let Some(ref desc) = assignment.description {
         let stripped = strip_html(desc);
         if !stripped.trim().is_empty() {
@@ -1163,7 +1606,6 @@ fn render_assignment_detail(f: &mut Frame, app: &App, area: Rect) {
         }
     }
 
-    // Link section
     if let Some(ref url) = assignment.html_url {
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
@@ -1183,127 +1625,377 @@ fn render_assignment_detail(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(detail, area);
 }
 
-// ─── Calendar ────────────────────────────────────────────────────────────────
+// ─── Calendar list (shared by render_schedule_calendar) ──────────────────────
 
-fn render_calendar(f: &mut Frame, app: &mut App, area: Rect) {
+fn render_calendar_list(f: &mut Frame, app: &mut App, area: Rect) {
+    let local_now = Local::now();
+    let today = local_now.date_naive();
     let focal_id = app.focal_assignment_id;
-    let mut items: Vec<ListItem> = Vec::new();
-    let mut current_date = String::new();
-    let mut selected_item_idx = 0usize;
 
-    for (i, entry) in app.calendar_items.iter().enumerate() {
-        let date_str = entry
-            .start_at
-            .map(|d| d.format("%A, %b %d").to_string())
-            .unwrap_or_else(|| "Unknown date".into());
+    // Group: (iso_year, iso_week) → NaiveDate → Vec<(original_idx, &CalendarItem)>
+    let mut by_week: BTreeMap<(i32, u32), BTreeMap<NaiveDate, Vec<(usize, &CalendarItem)>>> =
+        BTreeMap::new();
+    let mut undated: Vec<(usize, &CalendarItem)> = Vec::new();
 
-        if date_str != current_date {
-            current_date = date_str.clone();
-            items.push(ListItem::new(Line::from(vec![
-                Span::styled(" ▸  ", Style::default().fg(CAUTION)),
-                Span::styled(
-                    date_str,
-                    Style::default().fg(CAUTION).add_modifier(Modifier::BOLD),
-                ),
-            ])));
-        }
-
-        let time = entry
-            .start_at
-            .map(|d| d.format("%H:%M").to_string())
-            .unwrap_or_else(|| "─────".into());
-
-        let is_selected = i == app.calendar_list_state.selected;
-        let is_focal = entry.assignment_id.is_some() && entry.assignment_id == focal_id;
-
-        if is_selected {
-            selected_item_idx = items.len();
-        }
-
-        let (marker, marker_fg) = if is_selected {
-            ("▶", AMBER)
-        } else if is_focal {
-            ("»", FOCAL)
+    for (i, item) in app.calendar_items.iter().enumerate() {
+        if let Some(dt) = item.start_at {
+            let date = dt.with_timezone(&Local).date_naive();
+            let iso = date.iso_week();
+            by_week
+                .entry((iso.year(), iso.week()))
+                .or_default()
+                .entry(date)
+                .or_default()
+                .push((i, item));
         } else {
-            (" ", TEXT_MUTED)
-        };
-
-        let bg = if is_selected {
-            SEL_BG
-        } else if is_focal {
-            FOCAL_BG
-        } else {
-            Color::Reset
-        };
-
-        let type_color = match entry.item_type {
-            "assignment" => if is_focal { FOCAL } else { DANGER },
-            _ => INFO,
-        };
-
-        let type_badge = match entry.item_type {
-            "assignment" => "assign",
-            _ => "event ",
-        };
-
-        let title_style = Style::default().fg(TEXT).bg(bg).add_modifier(
-            if is_focal && !is_selected { Modifier::BOLD } else { Modifier::empty() },
-        );
-
-        let mut spans = vec![
-            Span::styled(format!(" {} ", marker), Style::default().fg(marker_fg).bg(bg)),
-            Span::styled(format!("{time}  "), Style::default().fg(TEXT_DIM).bg(bg)),
-            Span::styled(
-                format!("[{type_badge}]  "),
-                Style::default().fg(type_color).bg(bg),
-            ),
-            Span::styled(entry.title.clone(), title_style),
-        ];
-
-        if let Some(ref course) = entry.course_name {
-            spans.push(Span::styled(
-                format!("  ─  {}", course),
-                Style::default().fg(TEXT_MUTED).bg(bg),
-            ));
+            undated.push((i, item));
         }
-
-        if let Some(ref status) = entry.status {
-            let status_color = if status.starts_with("Missing") {
-                DANGER
-            } else if status.starts_with("Past due") {
-                CAUTION
-            } else if status.starts_with("Submitted") {
-                INFO
-            } else {
-                SUCCESS
-            };
-            spans.push(Span::styled(
-                format!("   [{}]", status),
-                Style::default().fg(status_color).bg(bg),
-            ));
-        }
-
-        items.push(ListItem::new(Line::from(spans)));
     }
 
-    if items.is_empty() {
-        items.push(ListItem::new(Line::from(Span::styled(
+    let mut list_items: Vec<ListItem> = Vec::new();
+    let mut selected_item_idx = 0usize;
+
+    for ((_, week_num), days) in &by_week {
+        let first_date = *days.keys().next().unwrap();
+        let last_date = *days.keys().last().unwrap();
+
+        // Which weekdays (0=Mon … 6=Sun) have items
+        let active_days: std::collections::HashSet<u32> =
+            days.keys().map(|d| d.weekday().num_days_from_monday()).collect();
+
+        // Week date-range label
+        let week_range = if first_date.month() == last_date.month() {
+            format!("{} – {}", first_date.format("%b %d"), last_date.format("%d"))
+        } else {
+            format!(
+                "{} – {}",
+                first_date.format("%b %d"),
+                last_date.format("%b %d")
+            )
+        };
+
+        // Day-dot strip: M T W T F S S  with ● for active days
+        let day_initials = ["M", "T", "W", "T", "F", "S", "S"];
+        let mut week_spans: Vec<Span> = vec![
+            Span::styled(
+                format!(" ◈  Wk {week_num:<2}  "),
+                Style::default()
+                    .fg(AMBER_SOFT)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("{week_range}   "),
+                Style::default().fg(TEXT_DIM),
+            ),
+        ];
+        for (d, &init) in day_initials.iter().enumerate() {
+            let has = active_days.contains(&(d as u32));
+            week_spans.push(Span::styled(
+                format!("{}{} ", init, if has { "●" } else { " " }),
+                Style::default().fg(if has { CAUTION } else { TEXT_MUTED }),
+            ));
+        }
+        list_items.push(ListItem::new(Line::from(week_spans)));
+
+        // Items within the week, grouped by day
+        for (date, day_items) in days {
+            let is_today = *date == today;
+            let is_past = *date < today;
+
+            let (day_color, day_label) = if is_today {
+                (
+                    AMBER,
+                    format!("  ◈ Today · {} ", date.format("%A, %b %d")),
+                )
+            } else if is_past {
+                (
+                    TEXT_MUTED,
+                    format!("  ─ {} ", date.format("%A, %b %d")),
+                )
+            } else {
+                (
+                    TEXT_DIM,
+                    format!("  ─ {} ", date.format("%A, %b %d")),
+                )
+            };
+
+            list_items.push(ListItem::new(Line::from(Span::styled(
+                day_label,
+                Style::default()
+                    .fg(day_color)
+                    .add_modifier(if is_today { Modifier::BOLD } else { Modifier::empty() }),
+            ))));
+
+            for (item_idx, item) in day_items {
+                let is_selected = *item_idx == app.calendar_list_state.selected;
+                let is_focal =
+                    item.assignment_id.is_some() && item.assignment_id == focal_id;
+
+                if is_selected {
+                    selected_item_idx = list_items.len();
+                }
+
+                let bg = if is_selected {
+                    SEL_BG
+                } else if is_focal {
+                    FOCAL_BG
+                } else {
+                    Color::Reset
+                };
+
+                let (marker, marker_fg) = if is_selected {
+                    ("▶", AMBER)
+                } else if is_focal {
+                    ("»", FOCAL)
+                } else {
+                    (" ", TEXT_MUTED)
+                };
+
+                let time = item
+                    .start_at
+                    .map(|d| d.with_timezone(&Local).format("%H:%M").to_string())
+                    .unwrap_or_else(|| "─────".into());
+
+                let (type_icon, type_color) = if item.item_type == "assignment" {
+                    ("◆", if is_focal { FOCAL } else { DANGER })
+                } else {
+                    ("◇", INFO)
+                };
+
+                let title_style = Style::default()
+                    .fg(if is_past { TEXT_DIM } else { TEXT })
+                    .bg(bg)
+                    .add_modifier(
+                        if is_selected || is_focal {
+                            Modifier::BOLD
+                        } else {
+                            Modifier::empty()
+                        },
+                    );
+
+                let status_span = match &item.status {
+                    Some(s) => {
+                        let sc = if s.starts_with("Missing") {
+                            DANGER
+                        } else if s.starts_with("Past due") {
+                            CAUTION
+                        } else if s.starts_with("Submitted") {
+                            INFO
+                        } else {
+                            SUCCESS
+                        };
+                        Span::styled(
+                            format!("  [{}]", s),
+                            Style::default().fg(sc).bg(bg),
+                        )
+                    }
+                    None => Span::styled("", Style::default().bg(bg)),
+                };
+
+                list_items.push(ListItem::new(vec![
+                    Line::from(vec![
+                        Span::styled(
+                            format!(" {} ", marker),
+                            Style::default().fg(marker_fg).bg(bg),
+                        ),
+                        Span::styled(
+                            format!("{time}  "),
+                            Style::default().fg(TEXT_DIM).bg(bg),
+                        ),
+                        Span::styled(
+                            format!("{type_icon}  "),
+                            Style::default().fg(type_color).bg(bg),
+                        ),
+                        Span::styled(item.title.clone(), title_style),
+                    ]),
+                    Line::from(vec![
+                        Span::styled("           ", Style::default().bg(bg)),
+                        Span::styled(
+                            item.course_name.as_deref().unwrap_or("").to_string(),
+                            Style::default().fg(TEXT_MUTED).bg(bg),
+                        ),
+                        status_span,
+                    ]),
+                ]));
+            }
+        }
+    }
+
+    // Undated items
+    if !undated.is_empty() {
+        list_items.push(ListItem::new(Line::from(Span::styled(
+            "  ─ No date ─────────────────────────",
+            Style::default().fg(TEXT_MUTED),
+        ))));
+        for (item_idx, item) in &undated {
+            let is_selected = *item_idx == app.calendar_list_state.selected;
+            if is_selected {
+                selected_item_idx = list_items.len();
+            }
+            let bg = if is_selected { SEL_BG } else { Color::Reset };
+            let (marker, marker_fg) =
+                if is_selected { ("▶", AMBER) } else { (" ", TEXT_MUTED) };
+            let (type_icon, type_color) = if item.item_type == "assignment" {
+                ("◆", DANGER)
+            } else {
+                ("◇", INFO)
+            };
+            list_items.push(ListItem::new(vec![
+                Line::from(vec![
+                    Span::styled(
+                        format!(" {} ", marker),
+                        Style::default().fg(marker_fg).bg(bg),
+                    ),
+                    Span::styled(
+                        format!("{type_icon}  "),
+                        Style::default().fg(type_color).bg(bg),
+                    ),
+                    Span::styled(
+                        item.title.clone(),
+                        Style::default()
+                            .fg(TEXT)
+                            .bg(bg)
+                            .add_modifier(if is_selected {
+                                Modifier::BOLD
+                            } else {
+                                Modifier::empty()
+                            }),
+                    ),
+                ]),
+                Line::from(vec![
+                    Span::styled("     ", Style::default().bg(bg)),
+                    Span::styled(
+                        item.course_name.as_deref().unwrap_or("").to_string(),
+                        Style::default().fg(TEXT_MUTED).bg(bg),
+                    ),
+                ]),
+            ]));
+        }
+    }
+
+    if list_items.is_empty() {
+        list_items.push(ListItem::new(Line::from(Span::styled(
             "  ○  No calendar entries found.",
             Style::default().fg(TEXT_DIM),
         ))));
     }
 
-    let list = List::new(items).block(
+    let list = List::new(list_items).block(
         Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(TEXT_MUTED))
-            .title(format!(" Calendar ({}) ", app.calendar_items.len()))
+            .title(format!(" Schedule [Calendar] ({})   v: list   Enter: submit ", app.calendar_items.len()))
             .title_style(Style::default().fg(AMBER).add_modifier(Modifier::BOLD)),
     );
 
-    app.calendar_list_state.inner.select(Some(selected_item_idx));
+    app.calendar_list_state
+        .inner
+        .select(Some(selected_item_idx));
     f.render_stateful_widget(list, area, &mut app.calendar_list_state.inner);
+}
+
+/// Render a lightweight detail view for a pure calendar event (no assignment backing).
+fn render_calendar_event_detail<'a>(
+    f: &mut Frame,
+    area: Rect,
+    detail_block: Block<'a>,
+    item: &CalendarItem,
+) {
+    let now = Utc::now();
+    let today = now.date_naive();
+    let label_style = Style::default().fg(AMBER_SOFT);
+    let value_style = Style::default().fg(TEXT);
+
+    let (type_icon, type_color, type_str) = if item.item_type == "assignment" {
+        ("◆", DANGER, "Assignment")
+    } else {
+        ("◇", INFO, "Event")
+    };
+
+    let (date_line, time_line) = if let Some(dt) = item.start_at {
+        let local = dt.with_timezone(&Local);
+        let date = local.date_naive();
+        let date_str = if date == today {
+            format!("{} (Today)", local.format("%A, %B %d, %Y"))
+        } else {
+            local.format("%A, %B %d, %Y").to_string()
+        };
+        (date_str, local.format("%H:%M").to_string())
+    } else {
+        ("No date".into(), "─".into())
+    };
+
+    let mut lines = vec![
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(format!("  {type_icon} "), Style::default().fg(type_color)),
+            Span::styled(
+                item.title.clone(),
+                Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  ── ", Style::default().fg(TEXT_MUTED)),
+            Span::styled(type_str, Style::default().fg(type_color)),
+            Span::styled(
+                " ─────────────────────────────",
+                Style::default().fg(TEXT_MUTED),
+            ),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  Date      ", label_style),
+            Span::styled(date_line, value_style),
+        ]),
+        Line::from(vec![
+            Span::styled("  Time      ", label_style),
+            Span::styled(time_line, value_style),
+        ]),
+    ];
+
+    if let Some(ref course) = item.course_name {
+        lines.push(Line::from(vec![
+            Span::styled("  Course    ", label_style),
+            Span::styled(course.clone(), value_style),
+        ]));
+    }
+
+    if let Some(ref status) = item.status {
+        let sc = if status.starts_with("Missing") {
+            DANGER
+        } else if status.starts_with("Past due") {
+            CAUTION
+        } else if status.starts_with("Submitted") {
+            INFO
+        } else {
+            SUCCESS
+        };
+        lines.push(Line::from(vec![
+            Span::styled("  Status    ", label_style),
+            Span::styled(status.clone(), Style::default().fg(sc)),
+        ]));
+    }
+
+    if let Some(dt) = item.start_at {
+        let (timer_text, timer_color) = countdown_timer(dt);
+        let timer_label = if item.item_type == "assignment" {
+            "  Due in    "
+        } else {
+            "  In        "
+        };
+        lines.push(Line::from(vec![
+            Span::styled(timer_label, label_style),
+            Span::styled(timer_text, Style::default().fg(timer_color)),
+        ]));
+    }
+
+    let detail = Paragraph::new(lines)
+        .wrap(Wrap { trim: false })
+        .block(detail_block);
+
+    f.render_widget(detail, area);
 }
 
 // ─── Announcements ───────────────────────────────────────────────────────────

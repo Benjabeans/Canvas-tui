@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use api::CanvasClient;
 use config::Config;
-use tui::App;
+use tui::{App, SubmissionState};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -108,8 +108,46 @@ async fn run_app(
             break;
         }
 
-        // Apply completed fetch results without blocking.
+        // ── $EDITOR launch (text-entry submissions) ───────────────────
+        if app.launch_editor {
+            app.launch_editor = false;
+
+            let tmp_path = std::env::temp_dir().join("canvas-tui-submission.txt");
+
+            // Suspend the TUI so the editor owns the terminal.
+            disable_raw_mode()?;
+            execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+            terminal.show_cursor()?;
+
+            let editor = std::env::var("VISUAL")
+                .or_else(|_| std::env::var("EDITOR"))
+                .unwrap_or_else(|_| "nano".into());
+
+            let _ = std::process::Command::new(&editor)
+                .arg(&tmp_path)
+                .status();
+
+            let content = std::fs::read_to_string(&tmp_path).unwrap_or_default();
+            let _ = std::fs::remove_file(&tmp_path);
+
+            // Restore the TUI.
+            enable_raw_mode()?;
+            execute!(terminal.backend_mut(), EnterAlternateScreen)?;
+            terminal.clear()?;
+
+            if content.trim().is_empty() {
+                app.submission_state = SubmissionState::TypePicker;
+                app.status_message =
+                    "Editor closed with no content — submission cancelled.".into();
+            } else {
+                app.submission_input = content;
+                app.submission_state = SubmissionState::TextPreview;
+            }
+        }
+
+        // Apply completed fetch/submission results without blocking.
         app.poll_fetch_result();
+        app.poll_submission_result();
 
         if app.needs_refresh {
             app.needs_refresh = false;

@@ -60,14 +60,23 @@ impl CanvasClient {
         self.get_url(url).await
     }
 
-    async fn get_url(&self, url: Url) -> Result<Response, CanvasError> {
+    async fn post_json<B: serde::Serialize>(
+        &self,
+        path: &str,
+        body: &B,
+    ) -> Result<Response, CanvasError> {
+        let url = self.api_url(path).map_err(CanvasError::Other)?;
         let resp = self
             .client
-            .get(url)
+            .post(url)
             .bearer_auth(&self.token)
+            .json(body)
             .send()
             .await?;
+        Self::check_status(resp).await
+    }
 
+    async fn check_status(resp: Response) -> Result<Response, CanvasError> {
         match resp.status() {
             StatusCode::UNAUTHORIZED => Err(CanvasError::Unauthorized),
             StatusCode::FORBIDDEN => Err(CanvasError::Api {
@@ -81,9 +90,7 @@ impl CanvasClient {
                     .and_then(|v| v.to_str().ok())
                     .and_then(|v| v.parse::<f64>().ok())
                     .unwrap_or(1.0);
-                Err(CanvasError::RateLimited {
-                    retry_after: retry,
-                })
+                Err(CanvasError::RateLimited { retry_after: retry })
             }
             s if s.is_client_error() || s.is_server_error() => {
                 let status = s.as_u16();
@@ -92,6 +99,16 @@ impl CanvasClient {
             }
             _ => Ok(resp),
         }
+    }
+
+    async fn get_url(&self, url: Url) -> Result<Response, CanvasError> {
+        let resp = self
+            .client
+            .get(url)
+            .bearer_auth(&self.token)
+            .send()
+            .await?;
+        Self::check_status(resp).await
     }
 
     async fn get_paginated<T: serde::de::DeserializeOwned>(
@@ -288,5 +305,208 @@ impl CanvasClient {
     pub async fn get_self(&self) -> Result<User, CanvasError> {
         let resp = self.get("/users/self").await?;
         Ok(resp.json().await?)
+    }
+
+    // ── Submission (create) ──────────────────────────────────────────────
+
+    /// Submit an online text entry. The body is sent as HTML; plain text is
+    /// wrapped in `<pre>` so whitespace and line breaks are preserved.
+    pub async fn submit_text_entry(
+        &self,
+        course_id: u64,
+        assignment_id: u64,
+        text: &str,
+    ) -> Result<Submission, CanvasError> {
+        let html = format!(
+            "<pre>{}</pre>",
+            text.replace('&', "&amp;")
+                .replace('<', "&lt;")
+                .replace('>', "&gt;")
+        );
+        let body = serde_json::json!({
+            "submission": {
+                "submission_type": "online_text_entry",
+                "body": html
+            }
+        });
+        let resp = self
+            .post_json(
+                &format!("/courses/{course_id}/assignments/{assignment_id}/submissions"),
+                &body,
+            )
+            .await?;
+        Ok(resp.json().await?)
+    }
+
+    /// Submit a URL.
+    pub async fn submit_url(
+        &self,
+        course_id: u64,
+        assignment_id: u64,
+        url: &str,
+    ) -> Result<Submission, CanvasError> {
+        let body = serde_json::json!({
+            "submission": {
+                "submission_type": "online_url",
+                "url": url
+            }
+        });
+        let resp = self
+            .post_json(
+                &format!("/courses/{course_id}/assignments/{assignment_id}/submissions"),
+                &body,
+            )
+            .await?;
+        Ok(resp.json().await?)
+    }
+
+    /// Full three-step file upload + submission.
+    pub async fn submit_file(
+        &self,
+        course_id: u64,
+        assignment_id: u64,
+        file_path: &std::path::Path,
+    ) -> Result<Submission, CanvasError> {
+        let filename = file_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("upload");
+
+        let data = std::fs::read(file_path).map_err(|e| {
+            CanvasError::Other(anyhow::anyhow!("Cannot read '{}': {e}", file_path.display()))
+        })?;
+        let size = data.len() as u64;
+
+        let content_type = mime_from_ext(file_path);
+
+        // Step 1 — request an upload slot from Canvas.
+        let slot_body = serde_json::json!({
+            "name": filename,
+            "size": size,
+            "content_type": content_type
+        });
+        let slot_resp = self
+            .post_json(
+                &format!(
+                    "/courses/{course_id}/assignments/{assignment_id}/submissions/self/files"
+                ),
+                &slot_body,
+            )
+            .await?;
+        let slot: FileUploadSlot = slot_resp.json().await?;
+
+        // Step 2 — upload bytes to the slot URL.
+        // Use a client that does NOT follow redirects so we can re-add auth on
+        // the Canvas confirmation redirect.
+        let file_id = self.upload_bytes_to_slot(&slot, filename, content_type, data).await?;
+
+        // Step 3 — create the submission with the uploaded file ID.
+        let sub_body = serde_json::json!({
+            "submission": {
+                "submission_type": "online_upload",
+                "file_ids": [file_id]
+            }
+        });
+        let resp = self
+            .post_json(
+                &format!("/courses/{course_id}/assignments/{assignment_id}/submissions"),
+                &sub_body,
+            )
+            .await?;
+        Ok(resp.json().await?)
+    }
+
+    async fn upload_bytes_to_slot(
+        &self,
+        slot: &FileUploadSlot,
+        filename: &str,
+        content_type: &str,
+        data: Vec<u8>,
+    ) -> Result<u64, CanvasError> {
+        let param_name = slot.file_param.as_deref().unwrap_or("file").to_string();
+
+        let mut form = reqwest::multipart::Form::new();
+        for (k, v) in &slot.upload_params {
+            form = form.text(k.clone(), v.clone());
+        }
+        let part = reqwest::multipart::Part::bytes(data)
+            .file_name(filename.to_string())
+            .mime_str(content_type)
+            .map_err(|e| CanvasError::Other(anyhow::anyhow!("Invalid content-type: {e}")))?;
+        form = form.part(param_name, part);
+
+        // Build a no-redirect client for the raw upload (S3/similar).
+        let upload_client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .user_agent("canvas-tui/0.1.0")
+            .build()
+            .map_err(CanvasError::Network)?;
+
+        let resp = upload_client
+            .post(&slot.upload_url)
+            .multipart(form)
+            .send()
+            .await?;
+
+        let status = resp.status();
+
+        if status.is_redirection() {
+            // Canvas redirects us to a confirmation endpoint — follow it with auth.
+            let location = resp
+                .headers()
+                .get("location")
+                .and_then(|v| v.to_str().ok())
+                .ok_or_else(|| {
+                    CanvasError::Other(anyhow::anyhow!(
+                        "Upload redirect missing Location header"
+                    ))
+                })?
+                .to_string();
+
+            let confirm = self
+                .client
+                .get(&location)
+                .bearer_auth(&self.token)
+                .send()
+                .await?;
+            let file: UploadedFile = confirm.json().await?;
+            return Ok(file.id);
+        }
+
+        if status.is_success() {
+            let file: UploadedFile = resp.json().await?;
+            return Ok(file.id);
+        }
+
+        Err(CanvasError::Api {
+            status: status.as_u16(),
+            message: resp.text().await.unwrap_or_default(),
+        })
+    }
+}
+
+fn mime_from_ext(path: &std::path::Path) -> &'static str {
+    match path.extension().and_then(|e| e.to_str()).unwrap_or("") {
+        "pdf" => "application/pdf",
+        "doc" => "application/msword",
+        "docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "ppt" => "application/vnd.ms-powerpoint",
+        "pptx" => "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        "xls" => "application/vnd.ms-excel",
+        "xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "txt" | "md" | "rst" => "text/plain",
+        "html" | "htm" => "text/html",
+        "csv" => "text/csv",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "zip" => "application/zip",
+        "py" => "text/x-python",
+        "rs" => "text/x-rust",
+        "js" => "text/javascript",
+        "ts" => "text/typescript",
+        "c" | "cpp" | "h" => "text/x-c",
+        "java" => "text/x-java",
+        _ => "application/octet-stream",
     }
 }

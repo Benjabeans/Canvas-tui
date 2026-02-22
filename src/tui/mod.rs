@@ -9,6 +9,65 @@ use ratatui::widgets::ListState as RListState;
 use std::collections::HashSet;
 use tokio::sync::oneshot;
 
+// ─── Submission ──────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SubmissionKind {
+    TextEntry,
+    Url,
+    FileUpload,
+}
+
+impl SubmissionKind {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::TextEntry => "Text Entry  (opens $EDITOR)",
+            Self::Url => "URL Submission",
+            Self::FileUpload => "File Upload",
+        }
+    }
+
+    pub fn from_api_type(s: &str) -> Option<Self> {
+        match s {
+            "online_text_entry" => Some(Self::TextEntry),
+            "online_url" => Some(Self::Url),
+            "online_upload" => Some(Self::FileUpload),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub enum SubmissionState {
+    #[default]
+    Hidden,
+    /// Choosing which submission type to use.
+    TypePicker,
+    /// User is typing a URL.
+    UrlInput,
+    /// User is typing a file path.
+    FileInput,
+    /// Showing text from $EDITOR before confirming.
+    TextPreview,
+    /// Final y/n confirm screen (URL or file).
+    Confirming,
+    /// Background task running.
+    Submitting,
+    /// API returned — show result.
+    Done { success: bool, message: String },
+}
+
+impl SubmissionState {
+    pub fn is_hidden(&self) -> bool {
+        matches!(self, Self::Hidden)
+    }
+}
+
+pub struct SubmitResult {
+    pub success: bool,
+    pub message: String,
+}
+
 // ─── Assignment Sort ─────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -35,6 +94,23 @@ impl AssignmentSort {
             Self::DueDateDesc => "Due ↓",
             Self::Course => "Course",
             Self::Status => "Status",
+        }
+    }
+}
+
+// ─── Unified Schedule View Mode ──────────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnifiedViewMode {
+    CalendarView,
+    ListView,
+}
+
+impl UnifiedViewMode {
+    pub fn toggle(self) -> Self {
+        match self {
+            Self::CalendarView => Self::ListView,
+            Self::ListView => Self::CalendarView,
         }
     }
 }
@@ -72,16 +148,14 @@ pub enum Tab {
     Dashboard,
     Courses,
     Assignments,
-    Calendar,
     Announcements,
 }
 
 impl Tab {
-    pub const ALL: [Tab; 5] = [
+    pub const ALL: [Tab; 4] = [
         Tab::Dashboard,
         Tab::Courses,
         Tab::Assignments,
-        Tab::Calendar,
         Tab::Announcements,
     ];
 
@@ -89,8 +163,7 @@ impl Tab {
         match self {
             Tab::Dashboard => "Dashboard",
             Tab::Courses => "Courses",
-            Tab::Assignments => "Assignments",
-            Tab::Calendar => "Calendar",
+            Tab::Assignments => "Schedule",
             Tab::Announcements => "Announcements",
         }
     }
@@ -130,6 +203,7 @@ pub struct App {
     pub dashboard_list_state: ListState,
     pub assignment_list_state: ListState,
     pub assignment_sort: AssignmentSort,
+    pub unified_view_mode: UnifiedViewMode,
     pub focal_assignment_id: Option<u64>,
     pub calendar_list_state: ListState,
     pub announcement_list_state: ListState,
@@ -147,6 +221,19 @@ pub struct App {
 
     // Background fetch channel
     pub fetch_rx: Option<oneshot::Receiver<FetchResult>>,
+
+    // Submission modal
+    pub submission_state: SubmissionState,
+    pub submission_kind: Option<SubmissionKind>,
+    pub submission_supported_kinds: Vec<SubmissionKind>,
+    pub submission_cursor: usize,
+    /// Shared text buffer: holds URL, file path, or editor content depending on state.
+    pub submission_input: String,
+    /// (course_id, assignment_id) of the assignment being submitted.
+    pub submission_target: Option<(u64, u64)>,
+    /// Set by event handler; consumed by the main loop to launch $EDITOR.
+    pub launch_editor: bool,
+    pub submission_rx: Option<oneshot::Receiver<SubmitResult>>,
 
     // Incremented each frame; used to drive the loading spinner.
     pub frame_count: u64,
@@ -210,6 +297,7 @@ impl App {
             dashboard_list_state: ListState::new(),
             assignment_list_state: ListState::new(),
             assignment_sort: AssignmentSort::DueDateAsc,
+            unified_view_mode: UnifiedViewMode::CalendarView,
             focal_assignment_id: None,
             calendar_list_state: ListState::new(),
             announcement_list_state: ListState::new(),
@@ -221,6 +309,14 @@ impl App {
             needs_refresh: false,
             cached_at: None,
             fetch_rx: None,
+            submission_state: SubmissionState::Hidden,
+            submission_kind: None,
+            submission_supported_kinds: Vec::new(),
+            submission_cursor: 0,
+            submission_input: String::new(),
+            submission_target: None,
+            launch_editor: false,
+            submission_rx: None,
             frame_count: 0,
         }
     }
@@ -433,19 +529,21 @@ impl App {
 
     /// Jump the active tab's list to the first item on or after today.
     pub fn jump_to_today_active(&mut self) {
-        match self.active_tab {
-            Tab::Calendar => {
+        if self.active_tab != Tab::Assignments {
+            return;
+        }
+        match self.unified_view_mode {
+            UnifiedViewMode::CalendarView => {
                 let idx = self.find_today_calendar_idx();
                 self.calendar_list_state.selected = idx;
             }
-            Tab::Assignments => {
+            UnifiedViewMode::ListView => {
                 let idx = match self.assignment_sort {
                     AssignmentSort::DueDateAsc => self.find_today_assignment_idx(),
                     _ => 0,
                 };
                 self.assignment_list_state.selected = idx;
             }
-            _ => {}
         }
     }
 
@@ -481,7 +579,7 @@ impl App {
             .map(|a| a.id)
     }
 
-    fn find_today_calendar_idx(&self) -> usize {
+    pub fn find_today_calendar_idx(&self) -> usize {
         let today = chrono::Utc::now().date_naive();
         self.calendar_items
             .iter()
@@ -494,7 +592,7 @@ impl App {
             .unwrap_or_else(|| self.calendar_items.len().saturating_sub(1))
     }
 
-    fn find_today_assignment_idx(&self) -> usize {
+    pub fn find_today_assignment_idx(&self) -> usize {
         let today = chrono::Utc::now().date_naive();
         let mut flat: Vec<&Assignment> = self
             .assignments
@@ -565,6 +663,17 @@ impl App {
         flat.into_iter().nth(self.assignment_list_state.selected)
     }
 
+    /// Look up a full (course_name, &Assignment) by Canvas assignment ID.
+    /// Used by the calendar view detail panel to show complete assignment data.
+    pub fn get_assignment_by_id(&self, id: u64) -> Option<(&str, &Assignment)> {
+        for (course_name, assignments) in &self.assignments {
+            if let Some(a) = assignments.iter().find(|a| a.id == id) {
+                return Some((course_name.as_str(), a));
+            }
+        }
+        None
+    }
+
     /// Returns the ordered list of course names that have assignments.
     pub fn assignment_course_names(&self) -> Vec<&str> {
         self.assignments.iter().map(|(name, _)| name.as_str()).collect()
@@ -625,12 +734,164 @@ impl App {
         upcoming.into_iter().nth(self.dashboard_list_state.selected)
     }
 
+    /// Open the submission modal for the currently selected assignment.
+    /// Works in both CalendarView and ListView modes.
+    /// Shows a status message and does nothing if the assignment doesn't
+    /// support any online submission type we handle.
+    pub fn open_submission_modal(&mut self) {
+        // Extract (course_id, assignment_id, submission_types) without holding borrows.
+        let resolved: Option<(u64, u64, Vec<String>)> =
+            if self.unified_view_mode == UnifiedViewMode::CalendarView {
+                // Calendar view: selected is an index into calendar_items.
+                let cal_aid = self
+                    .calendar_items
+                    .get(self.calendar_list_state.selected)
+                    .and_then(|item| item.assignment_id);
+
+                match cal_aid {
+                    None => {
+                        self.status_message = "Selected item is not an assignment.".into();
+                        return;
+                    }
+                    Some(aid) => {
+                        // Collect what we need into owned values so the borrow ends here.
+                        self.get_assignment_by_id(aid).map(|(_, a)| {
+                            (
+                                a.course_id.unwrap_or(0),
+                                a.id,
+                                a.submission_types.clone().unwrap_or_default(),
+                            )
+                        })
+                    }
+                }
+            } else {
+                // List view: use the existing helper.
+                self.get_selected_assignment().map(|(_, a)| {
+                    (
+                        a.course_id.unwrap_or(0),
+                        a.id,
+                        a.submission_types.clone().unwrap_or_default(),
+                    )
+                })
+            };
+
+        let Some((course_id, assignment_id, types)) = resolved else {
+            self.status_message = "No assignment selected.".into();
+            return;
+        };
+
+        if course_id == 0 {
+            self.status_message = "Cannot determine course for this assignment.".into();
+            return;
+        }
+
+        let supported: Vec<SubmissionKind> = types
+            .iter()
+            .filter_map(|t| SubmissionKind::from_api_type(t.as_str()))
+            .collect();
+
+        if supported.is_empty() {
+            self.status_message =
+                "This assignment does not support online submission.".into();
+            return;
+        }
+
+        self.submission_target = Some((course_id, assignment_id));
+        self.submission_supported_kinds = supported;
+        self.submission_cursor = 0;
+        self.submission_input.clear();
+        self.submission_kind = None;
+        self.submission_state = SubmissionState::TypePicker;
+    }
+
+    /// Kick off a background submission task using the current
+    /// `submission_kind` and `submission_input`.
+    pub fn start_submission(&mut self) {
+        let Some((course_id, assignment_id)) = self.submission_target else {
+            return;
+        };
+        let Some(ref kind) = self.submission_kind.clone() else {
+            return;
+        };
+
+        let content = self.submission_input.clone();
+        let client = self.client.clone();
+        let kind = kind.clone();
+
+        let (tx, rx) = oneshot::channel();
+        self.submission_rx = Some(rx);
+        self.submission_state = SubmissionState::Submitting;
+
+        tokio::spawn(async move {
+            let result: Result<(), String> = match kind {
+                SubmissionKind::TextEntry => client
+                    .submit_text_entry(course_id, assignment_id, &content)
+                    .await
+                    .map(|_| ())
+                    .map_err(|e| e.to_string()),
+                SubmissionKind::Url => client
+                    .submit_url(course_id, assignment_id, &content)
+                    .await
+                    .map(|_| ())
+                    .map_err(|e| e.to_string()),
+                SubmissionKind::FileUpload => {
+                    let path = std::path::Path::new(&content);
+                    client
+                        .submit_file(course_id, assignment_id, path)
+                        .await
+                        .map(|_| ())
+                        .map_err(|e| e.to_string())
+                }
+            };
+
+            let submit_result = match result {
+                Ok(()) => SubmitResult {
+                    success: true,
+                    message: "Submission successful! Press any key to close.".into(),
+                },
+                Err(e) => SubmitResult {
+                    success: false,
+                    message: format!("Submission failed: {e}"),
+                },
+            };
+
+            let _ = tx.send(submit_result);
+        });
+    }
+
+    /// Poll for a completed background submission. Returns true when done.
+    pub fn poll_submission_result(&mut self) -> bool {
+        let result = match self.submission_rx.as_mut() {
+            None => return false,
+            Some(rx) => match rx.try_recv() {
+                Ok(r) => r,
+                Err(oneshot::error::TryRecvError::Empty) => return false,
+                Err(oneshot::error::TryRecvError::Closed) => {
+                    self.submission_rx = None;
+                    return false;
+                }
+            },
+        };
+        self.submission_rx = None;
+        let success = result.success;
+        self.submission_state = SubmissionState::Done {
+            success,
+            message: result.message,
+        };
+        if success {
+            self.needs_refresh = true;
+        }
+        true
+    }
+
     pub fn active_list_state_mut(&mut self) -> &mut ListState {
         match self.active_tab {
             Tab::Dashboard => &mut self.dashboard_list_state,
             Tab::Courses => &mut self.course_list_state,
-            Tab::Assignments => &mut self.assignment_list_state,
-            Tab::Calendar => &mut self.calendar_list_state,
+            Tab::Assignments => match self.unified_view_mode {
+                UnifiedViewMode::CalendarView => &mut self.calendar_list_state,
+                UnifiedViewMode::ListView => &mut self.assignment_list_state,
+            },
             Tab::Announcements => &mut self.announcement_list_state,
         }
     }

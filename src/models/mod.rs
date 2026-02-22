@@ -138,6 +138,27 @@ pub struct CourseGrade {
     pub final_grade: Option<String>,
 }
 
+// ─── File Upload ────────────────────────────────────────────────────────────
+
+/// Returned by Canvas when you request an upload slot for a file submission.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileUploadSlot {
+    pub upload_url: String,
+    #[serde(default)]
+    pub upload_params: std::collections::HashMap<String, String>,
+    /// The multipart field name Canvas expects the file bytes under.
+    pub file_param: Option<String>,
+}
+
+/// Minimal file object returned by Canvas after a successful upload.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UploadedFile {
+    pub id: u64,
+    pub filename: Option<String>,
+    pub size: Option<u64>,
+    pub content_type: Option<String>,
+}
+
 // ─── Pagination ─────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Default)]

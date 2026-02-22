@@ -19,7 +19,7 @@ A terminal UI for Canvas LMS. Browse your courses, assignments, calendar, and an
 ### 1. Clone the repository
 
 ```bash
-git clone https://github.com/your-username/canvas-tui.git
+git clone https://github.com/benjabeans/canvas-tui.git
 cd canvas-tui
 ```
 
