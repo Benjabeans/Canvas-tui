@@ -145,9 +145,11 @@ async fn run_app(
             }
         }
 
-        // Apply completed fetch/submission results without blocking.
+        // Apply completed fetch/submission/course-detail results without blocking.
         app.poll_fetch_result();
         app.poll_submission_result();
+        app.poll_course_pages();
+        app.poll_course_detail();
 
         if app.needs_refresh {
             app.needs_refresh = false;

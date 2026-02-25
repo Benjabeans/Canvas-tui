@@ -138,6 +138,16 @@ pub struct CourseGrade {
     pub final_grade: Option<String>,
 }
 
+// ─── Pages ──────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Page {
+    pub title: Option<String>,
+    pub url: Option<String>,
+    pub body: Option<String>,
+    pub published: Option<bool>,
+}
+
 // ─── File Upload ────────────────────────────────────────────────────────────
 
 /// Returned by Canvas when you request an upload slot for a file submission.

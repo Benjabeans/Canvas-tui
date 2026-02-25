@@ -168,6 +168,23 @@ impl CanvasClient {
         Ok(resp.json().await?)
     }
 
+    // ── Pages ────────────────────────────────────────────────────────────
+
+    pub async fn list_pages(&self, course_id: u64) -> Result<Vec<Page>, CanvasError> {
+        self.get_all_pages(
+            &format!("/courses/{course_id}/pages"),
+            &[("per_page", "50")],
+        )
+        .await
+    }
+
+    pub async fn get_page(&self, course_id: u64, page_url: &str) -> Result<Page, CanvasError> {
+        let resp = self
+            .get(&format!("/courses/{course_id}/pages/{page_url}"))
+            .await?;
+        Ok(resp.json().await?)
+    }
+
     // ── Grades ──────────────────────────────────────────────────────────
 
     pub fn extract_grades(&self, courses: &[Course]) -> Vec<CourseGrade> {

@@ -194,6 +194,8 @@ fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
                 "   │   q quit   Tab switch   j/k nav   v list-view   Enter submit   t today   r refresh",
             (Tab::Assignments, UnifiedViewMode::ListView) =>
                 "   │   q quit   Tab switch   j/k nav   v cal-view   s sort   f filter   Enter submit   r refresh",
+            (Tab::Courses, _) =>
+                "   │   q quit   Tab switch   j/k nav   Enter details   Esc close   r refresh",
             _ =>
                 "   │   q quit   Tab switch   j/k nav   r refresh",
         };
@@ -1091,6 +1093,11 @@ fn render_course_filter_popup(f: &mut Frame, app: &mut App, area: Rect) {
 // ─── Courses ─────────────────────────────────────────────────────────────────
 
 fn render_courses(f: &mut Frame, app: &mut App, area: Rect) {
+    let chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(38), Constraint::Percentage(62)])
+        .split(area);
+
     let items: Vec<ListItem> = app
         .courses
         .iter()
@@ -1133,12 +1140,213 @@ fn render_courses(f: &mut Frame, app: &mut App, area: Rect) {
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(TEXT_MUTED))
-            .title(format!(" Courses ({}) ", app.courses.len()))
+            .title(format!(" Courses ({})   Enter: details ", app.courses.len()))
             .title_style(Style::default().fg(AMBER).add_modifier(Modifier::BOLD)),
     );
 
     app.course_list_state.inner.select(Some(app.course_list_state.selected));
-    f.render_stateful_widget(list, area, &mut app.course_list_state.inner);
+    f.render_stateful_widget(list, chunks[0], &mut app.course_list_state.inner);
+
+    render_course_detail(f, app, chunks[1]);
+
+    if app.show_course_pages_picker {
+        render_course_pages_picker(f, app, area);
+    }
+}
+
+fn render_course_detail(f: &mut Frame, app: &App, area: Rect) {
+    let course_name = app
+        .courses
+        .get(app.course_list_state.selected)
+        .and_then(|c| c.name.as_deref())
+        .unwrap_or("Course");
+
+    let has_content = app.course_detail_content.is_some()
+        || app.course_detail_loading
+        || app.course_pages_loading;
+
+    let detail_block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(TEXT_MUTED))
+        .title(format!(" {} ", course_name))
+        .title_style(Style::default().fg(AMBER).add_modifier(Modifier::BOLD))
+        .title_bottom(Line::from(Span::styled(
+            if has_content { " Esc: close " } else { "" },
+            Style::default().fg(TEXT_DIM),
+        )));
+
+    // Nothing loaded yet — show an empty prompt.
+    if !has_content {
+        let para = Paragraph::new(vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                "  Press Enter to browse course pages.",
+                Style::default().fg(TEXT_DIM),
+            )),
+        ])
+        .block(detail_block);
+        f.render_widget(para, area);
+        return;
+    }
+
+    if app.course_detail_loading || app.course_pages_loading {
+        let spin = spinner_char(app.frame_count);
+        let msg = if app.course_pages_loading {
+            "Fetching course pages…"
+        } else {
+            "Loading page content…"
+        };
+        let para = Paragraph::new(vec![
+            Line::from(""),
+            Line::from(vec![
+                Span::styled(format!("  {spin}  "), Style::default().fg(CAUTION)),
+                Span::styled(
+                    msg,
+                    Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+                ),
+            ]),
+        ])
+        .block(detail_block);
+        f.render_widget(para, area);
+        return;
+    }
+
+    let content = app
+        .course_detail_content
+        .as_deref()
+        .unwrap_or("No Details Found");
+
+    let is_no_details = content == "No Details Found";
+
+    if is_no_details {
+        let para = Paragraph::new(vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                "  No Details Found",
+                Style::default().fg(TEXT_DIM),
+            )),
+        ])
+        .block(detail_block);
+        f.render_widget(para, area);
+        return;
+    }
+
+    let stripped = strip_html(content);
+    let mut lines = vec![Line::from("")];
+
+    for text_line in stripped.lines() {
+        let trimmed = text_line.trim();
+        if trimmed.is_empty() {
+            lines.push(Line::from(""));
+        } else {
+            lines.push(Line::from(Span::styled(
+                format!("  {trimmed}"),
+                Style::default().fg(TEXT),
+            )));
+        }
+    }
+
+    let links = extract_links(content);
+    if !links.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "  ── Links ────────────────────────────────────",
+            Style::default().fg(TEXT_MUTED),
+        )));
+        for (text, url) in &links {
+            if text != url {
+                lines.push(Line::from(Span::styled(
+                    format!("  {text}"),
+                    Style::default().fg(TEXT_DIM),
+                )));
+            }
+            lines.push(Line::from(Span::styled(
+                format!("  {url}"),
+                Style::default().fg(INFO),
+            )));
+        }
+    }
+
+    let para = Paragraph::new(lines)
+        .wrap(Wrap { trim: false })
+        .block(detail_block);
+
+    f.render_widget(para, area);
+}
+
+fn render_course_pages_picker(f: &mut Frame, app: &mut App, area: Rect) {
+    let pages = &app.course_pages;
+    let count = pages.len();
+    if count == 0 {
+        return;
+    }
+
+    let max_name_len = pages
+        .iter()
+        .map(|p| p.title.as_deref().unwrap_or("Untitled").len())
+        .max()
+        .unwrap_or(10);
+    let popup_w = (max_name_len as u16 + 10).min(area.width.saturating_sub(4));
+    let popup_h = ((count as u16) + 4).min(area.height.saturating_sub(2));
+    let popup = popup_rect(popup_w, popup_h, area);
+
+    f.render_widget(Clear, popup);
+
+    let items: Vec<ListItem> = pages
+        .iter()
+        .enumerate()
+        .map(|(i, page)| {
+            let title = page.title.as_deref().unwrap_or("Untitled");
+            let is_selected = i == app.course_pages_list_state.selected;
+            let bg = if is_selected { SEL_BG } else { Color::Reset };
+            let (marker, marker_fg) = if is_selected {
+                ("▶", AMBER)
+            } else {
+                (" ", TEXT_MUTED)
+            };
+
+            ListItem::new(Line::from(vec![
+                Span::styled(
+                    format!(" {} ", marker),
+                    Style::default().fg(marker_fg).bg(bg),
+                ),
+                Span::styled(
+                    title,
+                    Style::default()
+                        .fg(if is_selected { TEXT } else { TEXT_DIM })
+                        .bg(bg)
+                        .add_modifier(if is_selected {
+                            Modifier::BOLD
+                        } else {
+                            Modifier::empty()
+                        }),
+                ),
+            ]))
+        })
+        .collect();
+
+    let list = List::new(items).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(AMBER_SOFT))
+            .title(format!(" Select Page ({}) ", count))
+            .title_style(Style::default().fg(AMBER).add_modifier(Modifier::BOLD))
+            .title_bottom(Line::from(vec![
+                Span::styled(" j/k ", Style::default().fg(AMBER_SOFT)),
+                Span::styled("move  ", Style::default().fg(TEXT_DIM)),
+                Span::styled("Enter ", Style::default().fg(AMBER_SOFT)),
+                Span::styled("select  ", Style::default().fg(TEXT_DIM)),
+                Span::styled("Esc ", Style::default().fg(AMBER_SOFT)),
+                Span::styled("cancel ", Style::default().fg(TEXT_DIM)),
+            ])),
+    );
+
+    app.course_pages_list_state
+        .inner
+        .select(Some(app.course_pages_list_state.selected));
+    f.render_stateful_widget(list, popup, &mut app.course_pages_list_state.inner);
 }
 
 // ─── Schedule (unified Calendar + Assignments) ────────────────────────────────
@@ -1690,6 +1898,22 @@ fn render_assignment_detail_for<'a>(
 
 // ─── Calendar list (shared by render_schedule_calendar) ──────────────────────
 
+/// Derive the ◆ icon color for a calendar assignment item based on its status:
+///   graded (score)  → green
+///   submitted       → blue
+///   everything else → red  (unsubmitted, missing, past due, upcoming todo)
+fn calendar_item_status_color(item: &CalendarItem, is_focal: bool) -> Color {
+    if is_focal {
+        return FOCAL;
+    }
+    match &item.status {
+        Some(s) if s == "Submitted" => INFO,
+        Some(s) if s.starts_with("Missing") || s.starts_with("Past due") => DANGER,
+        Some(_) => SUCCESS, // score or "Graded"
+        None => DANGER,     // unsubmitted
+    }
+}
+
 fn render_calendar_list(f: &mut Frame, app: &mut App, area: Rect) {
     let local_now = Local::now();
     let today = local_now.date_naive();
@@ -1739,26 +1963,31 @@ fn render_calendar_list(f: &mut Frame, app: &mut App, area: Rect) {
 
         // Day-dot strip: M T W T F S S  with ● for active days
         let day_initials = ["M", "T", "W", "T", "F", "S", "S"];
+        let week_bg = HDR_BG;
         let mut week_spans: Vec<Span> = vec![
             Span::styled(
                 format!(" ◈  Wk {week_num:<2}  "),
                 Style::default()
-                    .fg(AMBER_SOFT)
+                    .fg(AMBER)
+                    .bg(week_bg)
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
                 format!("{week_range}   "),
-                Style::default().fg(TEXT_DIM),
+                Style::default().fg(TEXT_DIM).bg(week_bg),
             ),
         ];
         for (d, &init) in day_initials.iter().enumerate() {
             let has = active_days.contains(&(d as u32));
             week_spans.push(Span::styled(
                 format!("{}{} ", init, if has { "●" } else { " " }),
-                Style::default().fg(if has { CAUTION } else { TEXT_MUTED }),
+                Style::default().fg(if has { CAUTION } else { TEXT_MUTED }).bg(week_bg),
             ));
         }
-        list_items.push(ListItem::new(Line::from(week_spans)));
+        list_items.push(
+            ListItem::new(Line::from(week_spans))
+                .style(Style::default().bg(week_bg)),
+        );
 
         // Items within the week, grouped by day
         for (date, day_items) in days {
@@ -1820,7 +2049,8 @@ fn render_calendar_list(f: &mut Frame, app: &mut App, area: Rect) {
                     .unwrap_or_else(|| "─────".into());
 
                 let (type_icon, type_color) = if item.item_type == "assignment" {
-                    ("◆", if is_focal { FOCAL } else { DANGER })
+                    let color = calendar_item_status_color(item, is_focal);
+                    ("◆", color)
                 } else {
                     ("◇", INFO)
                 };
@@ -1899,7 +2129,7 @@ fn render_calendar_list(f: &mut Frame, app: &mut App, area: Rect) {
             let (marker, marker_fg) =
                 if is_selected { ("▶", AMBER) } else { (" ", TEXT_MUTED) };
             let (type_icon, type_color) = if item.item_type == "assignment" {
-                ("◆", DANGER)
+                ("◆", calendar_item_status_color(item, false))
             } else {
                 ("◇", INFO)
             };

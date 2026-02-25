@@ -18,6 +18,12 @@ pub fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
         return;
     }
 
+    // ── Course pages picker intercepts while open ────────────────────
+    if app.show_course_pages_picker {
+        handle_course_pages_key(app, code);
+        return;
+    }
+
     match (code, modifiers) {
         (KeyCode::Char('q'), _) | (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
             app.running = false;
@@ -96,6 +102,16 @@ pub fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
             app.filter_list_state.selected = 0;
             app.show_course_filter = true;
         }
+        // Courses tab: Enter fetches page list, Esc closes detail.
+        KeyCode::Enter if app.active_tab == super::Tab::Courses => {
+            app.fetch_course_pages();
+        }
+        KeyCode::Esc if app.active_tab == super::Tab::Courses => {
+            app.course_detail_content = None;
+            app.course_detail_loading = false;
+            app.course_detail_rx = None;
+            app.show_course_pages_picker = false;
+        }
         // Open submission modal for the selected item (works in both view modes).
         KeyCode::Enter if app.active_tab == super::Tab::Assignments => {
             app.open_submission_modal();
@@ -109,6 +125,24 @@ pub fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
         }
         KeyCode::Char('r') if !app.loading => {
             app.needs_refresh = true;
+        }
+        _ => {}
+    }
+}
+
+fn handle_course_pages_key(app: &mut App, code: KeyCode) {
+    match code {
+        KeyCode::Down | KeyCode::Char('j') => {
+            app.course_pages_list_state.select_next();
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            app.course_pages_list_state.select_prev();
+        }
+        KeyCode::Enter => {
+            app.fetch_selected_page();
+        }
+        KeyCode::Esc | KeyCode::Char('q') => {
+            app.show_course_pages_picker = false;
         }
         _ => {}
     }

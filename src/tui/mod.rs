@@ -235,6 +235,16 @@ pub struct App {
     pub launch_editor: bool,
     pub submission_rx: Option<oneshot::Receiver<SubmitResult>>,
 
+    // Course pages picker & detail
+    pub course_pages: Vec<crate::models::Page>,
+    pub show_course_pages_picker: bool,
+    pub course_pages_list_state: ListState,
+    pub course_pages_loading: bool,
+    pub course_pages_rx: Option<oneshot::Receiver<Vec<crate::models::Page>>>,
+    pub course_detail_content: Option<String>,
+    pub course_detail_loading: bool,
+    pub course_detail_rx: Option<oneshot::Receiver<Option<String>>>,
+
     // Incremented each frame; used to drive the loading spinner.
     pub frame_count: u64,
 }
@@ -319,6 +329,14 @@ impl App {
             submission_target: None,
             launch_editor: false,
             submission_rx: None,
+            course_pages: Vec::new(),
+            show_course_pages_picker: false,
+            course_pages_list_state: ListState::new(),
+            course_pages_loading: false,
+            course_pages_rx: None,
+            course_detail_content: None,
+            course_detail_loading: false,
+            course_detail_rx: None,
             frame_count: 0,
         }
     }
@@ -907,6 +925,106 @@ impl App {
         if success {
             self.needs_refresh = true;
         }
+        true
+    }
+
+    /// Fetch the list of available pages for the currently selected course.
+    pub fn fetch_course_pages(&mut self) {
+        let Some(course) = self.courses.get(self.course_list_state.selected) else {
+            return;
+        };
+        let course_id = course.id;
+        let client = self.client.clone();
+        let (tx, rx) = oneshot::channel();
+        self.course_pages_rx = Some(rx);
+        self.course_pages_loading = true;
+        self.course_pages.clear();
+        self.course_detail_content = None;
+        self.show_course_pages_picker = false;
+
+        tokio::spawn(async move {
+            let pages = client.list_pages(course_id).await.unwrap_or_default();
+            let _ = tx.send(pages);
+        });
+    }
+
+    /// Poll for the completed page-list fetch. Opens the picker when ready.
+    pub fn poll_course_pages(&mut self) -> bool {
+        let result = match self.course_pages_rx.as_mut() {
+            None => return false,
+            Some(rx) => match rx.try_recv() {
+                Ok(r) => r,
+                Err(oneshot::error::TryRecvError::Empty) => return false,
+                Err(oneshot::error::TryRecvError::Closed) => {
+                    self.course_pages_rx = None;
+                    self.course_pages_loading = false;
+                    return false;
+                }
+            },
+        };
+        self.course_pages_rx = None;
+        self.course_pages_loading = false;
+
+        if result.is_empty() {
+            self.status_message = "No pages found for this course.".into();
+        } else {
+            self.course_pages_list_state.set_len(result.len());
+            self.course_pages_list_state.selected = 0;
+            self.course_pages = result;
+            self.show_course_pages_picker = true;
+        }
+        true
+    }
+
+    /// Fetch the body of a specific page selected from the picker.
+    pub fn fetch_selected_page(&mut self) {
+        let Some(page) = self.course_pages.get(self.course_pages_list_state.selected) else {
+            return;
+        };
+        let Some(page_url) = page.url.clone() else {
+            self.status_message = "Page has no URL.".into();
+            return;
+        };
+        let Some(course) = self.courses.get(self.course_list_state.selected) else {
+            return;
+        };
+        let course_id = course.id;
+        let client = self.client.clone();
+        let (tx, rx) = oneshot::channel();
+        self.course_detail_rx = Some(rx);
+        self.course_detail_loading = true;
+        self.course_detail_content = None;
+        self.show_course_pages_picker = false;
+
+        tokio::spawn(async move {
+            let result = client
+                .get_page(course_id, &page_url)
+                .await
+                .ok()
+                .and_then(|p| p.body);
+            let _ = tx.send(result);
+        });
+    }
+
+    /// Poll for a completed course page body fetch.
+    pub fn poll_course_detail(&mut self) -> bool {
+        let result = match self.course_detail_rx.as_mut() {
+            None => return false,
+            Some(rx) => match rx.try_recv() {
+                Ok(r) => r,
+                Err(oneshot::error::TryRecvError::Empty) => return false,
+                Err(oneshot::error::TryRecvError::Closed) => {
+                    self.course_detail_rx = None;
+                    self.course_detail_loading = false;
+                    return false;
+                }
+            },
+        };
+        self.course_detail_rx = None;
+        self.course_detail_loading = false;
+        self.course_detail_content = Some(
+            result.unwrap_or_else(|| "No Details Found".into()),
+        );
         true
     }
 
