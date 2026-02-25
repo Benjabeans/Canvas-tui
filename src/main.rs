@@ -4,14 +4,14 @@ mod config;
 mod models;
 mod tui;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use crossterm::{
     event::{Event, KeyEvent},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use ratatui::{backend::CrosstermBackend, Terminal};
-use std::io;
+use std::io::{self, Write};
 use std::time::Duration;
 
 use api::CanvasClient;
@@ -48,13 +48,8 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    let config = Config::load().with_context(|| {
-        "Failed to load configuration.\n\
-         Run `canvas-tui --init` to generate a config file,\n\
-         or set CANVAS_URL and CANVAS_API_TOKEN environment variables."
-    })?;
-
-    let client = CanvasClient::new(&config.canvas_url, &config.api_token)?;
+    // Try to load config; if it fails we may still have cache to show.
+    let config = Config::load();
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -62,7 +57,7 @@ async fn main() -> Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let result = run_app(&mut terminal, client).await;
+    let result = run_app(&mut terminal, config).await;
 
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
@@ -75,10 +70,105 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+/// Prompt the user for their Canvas API token outside the TUI (raw mode
+/// suspended).  Returns the trimmed token string.
+fn prompt_api_token(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+) -> Result<String> {
+    disable_raw_mode()?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    terminal.show_cursor()?;
+
+    println!();
+    println!("╔══════════════════════════════════════════════════════╗");
+    println!("║   Canvas API token is missing or expired.           ║");
+    println!("║   Generate a new token in Canvas:                   ║");
+    println!("║   Account → Settings → New Access Token             ║");
+    println!("╚══════════════════════════════════════════════════════╝");
+    println!();
+    print!("Paste your API token: ");
+    io::stdout().flush()?;
+
+    let mut token = String::new();
+    io::stdin().read_line(&mut token)?;
+    let token = token.trim().to_string();
+
+    // Restore the TUI.
+    enable_raw_mode()?;
+    execute!(terminal.backend_mut(), EnterAlternateScreen)?;
+    terminal.clear()?;
+
+    Ok(token)
+}
+
+/// Prompt for the Canvas base URL outside the TUI.
+fn prompt_canvas_url(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+) -> Result<String> {
+    disable_raw_mode()?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    terminal.show_cursor()?;
+
+    println!();
+    println!("╔══════════════════════════════════════════════════════╗");
+    println!("║   No configuration found.                           ║");
+    println!("║   Let's set up your Canvas connection.              ║");
+    println!("╚══════════════════════════════════════════════════════╝");
+    println!();
+    print!("Canvas URL (e.g. https://school.instructure.com): ");
+    io::stdout().flush()?;
+
+    let mut url = String::new();
+    io::stdin().read_line(&mut url)?;
+    let url = url.trim().to_string();
+
+    enable_raw_mode()?;
+    execute!(terminal.backend_mut(), EnterAlternateScreen)?;
+    terminal.clear()?;
+
+    Ok(url)
+}
+
 async fn run_app(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    client: CanvasClient,
+    config_result: Result<Config>,
 ) -> Result<()> {
+    // Resolve config — if missing, prompt interactively for URL + token.
+    let config = match config_result {
+        Ok(cfg) => cfg,
+        Err(_) => {
+            // No config at all. If we have cache, show it while we prompt.
+            if let Some(cached) = cache::load_cache() {
+                // We need a placeholder client; we'll replace it after prompting.
+                let url = prompt_canvas_url(terminal)?;
+                let token = prompt_api_token(terminal)?;
+                let cfg = Config {
+                    canvas_url: url,
+                    api_token: token,
+                };
+                let _ = cfg.save();
+
+                let client = CanvasClient::new(&cfg.canvas_url, &cfg.api_token)?;
+                let mut app = App::new(client);
+                app.load_from_cache(cached);
+                app.start_fetch();
+                app.status_message = "Config saved — syncing with new token…".into();
+                return run_main_loop(terminal, app, cfg).await;
+            }
+
+            // No cache either — must prompt.
+            let url = prompt_canvas_url(terminal)?;
+            let token = prompt_api_token(terminal)?;
+            let cfg = Config {
+                canvas_url: url,
+                api_token: token,
+            };
+            let _ = cfg.save();
+            cfg
+        }
+    };
+
+    let client = CanvasClient::new(&config.canvas_url, &config.api_token)?;
     let mut app = App::new(client);
 
     // Show cached data instantly, then kick off a background sync.
@@ -89,6 +179,15 @@ async fn run_app(
     } else {
         app.start_fetch();
     }
+
+    run_main_loop(terminal, app, config).await
+}
+
+async fn run_main_loop(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    mut app: App,
+    mut config: Config,
+) -> Result<()> {
     terminal.draw(|f| tui::ui::render(f, &mut app))?;
 
     loop {
@@ -150,6 +249,31 @@ async fn run_app(
         app.poll_submission_result();
         app.poll_course_pages();
         app.poll_course_detail();
+
+        // ── Re-authentication prompt ──────────────────────────────────
+        if app.needs_reauth {
+            app.needs_reauth = false;
+
+            let token = prompt_api_token(terminal)?;
+            if token.is_empty() {
+                app.status_message =
+                    "No token entered — still using cached data. Press r to retry.".into();
+            } else {
+                config.api_token = token;
+                let _ = config.save();
+
+                match CanvasClient::new(&config.canvas_url, &config.api_token) {
+                    Ok(new_client) => {
+                        app.client = new_client;
+                        app.status_message = "Token updated — syncing…".into();
+                        app.start_fetch();
+                    }
+                    Err(e) => {
+                        app.status_message = format!("Bad config: {e}");
+                    }
+                }
+            }
+        }
 
         if app.needs_refresh {
             app.needs_refresh = false;

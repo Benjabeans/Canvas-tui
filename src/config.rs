@@ -49,6 +49,18 @@ impl Config {
         Ok(path)
     }
 
+    /// Persist this config to disk (creates parent directories if needed).
+    pub fn save(&self) -> Result<()> {
+        let path = Self::config_path()
+            .with_context(|| "Could not determine config directory")?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let toml_str = toml::to_string_pretty(self)?;
+        std::fs::write(&path, toml_str)?;
+        Ok(())
+    }
+
     fn config_path() -> Option<PathBuf> {
         dirs::config_dir().map(|d| d.join("canvas-tui").join("config.toml"))
     }

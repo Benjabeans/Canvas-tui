@@ -126,6 +126,8 @@ pub struct FetchResult {
     pub fetched_at: DateTime<Utc>,
     /// Non-fatal error message to show in the status bar.
     pub error: Option<String>,
+    /// The first API call returned 401 Unauthorized — token is missing or expired.
+    pub is_auth_error: bool,
 }
 
 // ─── Calendar Item ───────────────────────────────────────────────────────────
@@ -217,6 +219,7 @@ pub struct App {
     pub status_message: String,
     pub loading: bool,
     pub needs_refresh: bool,
+    pub needs_reauth: bool,
     pub cached_at: Option<DateTime<Utc>>,
 
     // Background fetch channel
@@ -319,6 +322,7 @@ impl App {
             status_message: "Loading...".into(),
             loading: true,
             needs_refresh: false,
+            needs_reauth: false,
             cached_at: None,
             fetch_rx: None,
             submission_state: SubmissionState::Hidden,
@@ -422,6 +426,38 @@ impl App {
     }
 
     fn apply_fetch_result(&mut self, result: FetchResult) {
+        self.loading = false;
+
+        // Auth error — signal the main loop to prompt for a new API key.
+        // Keep whatever cached data is already displayed.
+        if result.is_auth_error {
+            self.needs_reauth = true;
+            self.status_message =
+                "Authentication failed — API token is missing or expired.".into();
+            return;
+        }
+
+        // Network / other non-fatal error — keep cached data, just show the error.
+        if let Some(ref err) = result.error {
+            if !self.courses.is_empty() {
+                // We already have cached data — don't overwrite it.
+                let cached_hint = self
+                    .cached_at
+                    .map(|t| {
+                        format!(
+                            " Showing cached data from {}.",
+                            t.with_timezone(&chrono::Local).format("%b %d %H:%M")
+                        )
+                    })
+                    .unwrap_or_default();
+                self.status_message = format!("Sync failed: {err}.{cached_hint}");
+                return;
+            }
+            // No cached data at all — still apply what we got (likely empty).
+            self.status_message = format!("Sync error: {err}");
+        }
+
+        // Success (or partial success with no cached fallback) — apply fresh data.
         self.user = result.user;
         self.course_list_state.set_len(result.courses.len());
         self.courses = result.courses;
@@ -444,11 +480,8 @@ impl App {
         self.assignment_list_state.needs_center = true;
 
         self.cached_at = Some(result.fetched_at);
-        self.loading = false;
 
-        if let Some(err) = result.error {
-            self.status_message = format!("Sync error: {err}");
-        } else {
+        if result.error.is_none() {
             let name = self
                 .user
                 .as_ref()
@@ -1052,10 +1085,16 @@ async fn fetch_canvas_data(client: CanvasClient) -> FetchResult {
         announcements: Vec::new(),
         fetched_at: Utc::now(),
         error: None,
+        is_auth_error: false,
     };
 
     match client.get_self().await {
         Ok(user) => result.user = Some(user),
+        Err(crate::api::CanvasError::Unauthorized) => {
+            result.is_auth_error = true;
+            result.error = Some("Unauthorized – check your API token".into());
+            return result;
+        }
         Err(e) => {
             result.error = Some(format!("fetching profile: {e}"));
             return result;
