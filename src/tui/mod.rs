@@ -250,13 +250,15 @@ pub struct ListState {
     pub inner: RListState,
     pub selected: usize,
     pub len: usize,
+    /// When true, the next render should center the selected item in the viewport.
+    pub needs_center: bool,
 }
 
 impl ListState {
     pub fn new() -> Self {
         let mut inner = RListState::default();
         inner.select(Some(0));
-        Self { inner, selected: 0, len: 0 }
+        Self { inner, selected: 0, len: 0, needs_center: false }
     }
 
     /// Move down — clamped at the last item (no wrap-around).
@@ -341,8 +343,10 @@ impl App {
 
         let cal_idx = self.find_today_calendar_idx();
         self.calendar_list_state.selected = cal_idx;
+        self.calendar_list_state.needs_center = true;
         let asgn_idx = self.find_today_assignment_idx();
         self.assignment_list_state.selected = asgn_idx;
+        self.assignment_list_state.needs_center = true;
 
         self.cached_at = Some(cache.cached_at);
         self.loading = false;
@@ -416,8 +420,10 @@ impl App {
 
         let cal_idx = self.find_today_calendar_idx();
         self.calendar_list_state.selected = cal_idx;
+        self.calendar_list_state.needs_center = true;
         let asgn_idx = self.find_today_assignment_idx();
         self.assignment_list_state.selected = asgn_idx;
+        self.assignment_list_state.needs_center = true;
 
         self.cached_at = Some(result.fetched_at);
         self.loading = false;
@@ -536,6 +542,7 @@ impl App {
             UnifiedViewMode::CalendarView => {
                 let idx = self.find_today_calendar_idx();
                 self.calendar_list_state.selected = idx;
+                self.calendar_list_state.needs_center = true;
             }
             UnifiedViewMode::ListView => {
                 let idx = match self.assignment_sort {
@@ -543,6 +550,7 @@ impl App {
                     _ => 0,
                 };
                 self.assignment_list_state.selected = idx;
+                self.assignment_list_state.needs_center = true;
             }
         }
     }
@@ -734,6 +742,19 @@ impl App {
         upcoming.into_iter().nth(self.dashboard_list_state.selected)
     }
 
+    /// Open the submission modal from the Dashboard upcoming-assignments list.
+    pub fn open_dashboard_submission_modal(&mut self) {
+        let resolved: Option<(u64, u64, Vec<String>)> =
+            self.get_selected_dashboard_assignment().map(|(_, a)| {
+                (
+                    a.course_id.unwrap_or(0),
+                    a.id,
+                    a.submission_types.clone().unwrap_or_default(),
+                )
+            });
+        self.finish_open_submission(resolved);
+    }
+
     /// Open the submission modal for the currently selected assignment.
     /// Works in both CalendarView and ListView modes.
     /// Shows a status message and does nothing if the assignment doesn't
@@ -775,6 +796,11 @@ impl App {
                 })
             };
 
+        self.finish_open_submission(resolved);
+    }
+
+    /// Shared validation and state setup for opening the submission modal.
+    fn finish_open_submission(&mut self, resolved: Option<(u64, u64, Vec<String>)>) {
         let Some((course_id, assignment_id, types)) = resolved else {
             self.status_message = "No assignment selected.".into();
             return;

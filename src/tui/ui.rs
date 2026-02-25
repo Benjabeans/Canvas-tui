@@ -294,6 +294,10 @@ fn render_dashboard(f: &mut Frame, app: &mut App, area: Rect) {
 
     render_upcoming_assignments(f, app, bottom[0]);
     render_dashboard_detail(f, app, bottom[1]);
+
+    if !app.submission_state.is_hidden() {
+        render_submission_modal(f, app, area);
+    }
 }
 
 fn render_upcoming_assignments(f: &mut Frame, app: &mut App, area: Rect) {
@@ -447,7 +451,7 @@ fn render_upcoming_assignments(f: &mut Frame, app: &mut App, area: Rect) {
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(TEXT_MUTED))
-            .title(format!(" Upcoming ({}) ", upcoming.len()))
+            .title(format!(" Upcoming ({})   Enter: submit ", upcoming.len()))
             .title_style(Style::default().fg(AMBER).add_modifier(Modifier::BOLD)),
     );
 
@@ -598,6 +602,27 @@ fn render_dashboard_detail(f: &mut Frame, app: &App, area: Rect) {
                 format!("  {}", stripped.trim()),
                 Style::default().fg(TEXT_DIM),
             )));
+        }
+
+        let desc_links = extract_links(desc);
+        if !desc_links.is_empty() {
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "  ── Links ────────────────────────────────────",
+                Style::default().fg(TEXT_MUTED),
+            )));
+            for (text, url) in &desc_links {
+                if text != url {
+                    lines.push(Line::from(Span::styled(
+                        format!("  {text}"),
+                        Style::default().fg(TEXT_DIM),
+                    )));
+                }
+                lines.push(Line::from(Span::styled(
+                    format!("  {url}"),
+                    Style::default().fg(INFO),
+                )));
+            }
         }
     }
 
@@ -1355,6 +1380,14 @@ fn render_assignments_grouped(f: &mut Frame, app: &mut App, area: Rect, block_ti
     );
 
     app.assignment_list_state.inner.select(Some(selected_item_idx));
+
+    if app.assignment_list_state.needs_center {
+        app.assignment_list_state.needs_center = false;
+        let visible_items = ((area.height.saturating_sub(2)) / 2) as usize;
+        let half = visible_items / 2;
+        *app.assignment_list_state.inner.offset_mut() = selected_item_idx.saturating_sub(half);
+    }
+
     f.render_stateful_widget(list, area, &mut app.assignment_list_state.inner);
 }
 
@@ -1450,6 +1483,15 @@ fn render_assignments_flat(f: &mut Frame, app: &mut App, area: Rect, block_title
     app.assignment_list_state
         .inner
         .select(Some(app.assignment_list_state.selected));
+
+    if app.assignment_list_state.needs_center {
+        app.assignment_list_state.needs_center = false;
+        let visible_items = ((area.height.saturating_sub(2)) / 2) as usize;
+        let half = visible_items / 2;
+        *app.assignment_list_state.inner.offset_mut() =
+            app.assignment_list_state.selected.saturating_sub(half);
+    }
+
     f.render_stateful_widget(list, area, &mut app.assignment_list_state.inner);
 }
 
@@ -1603,6 +1645,27 @@ fn render_assignment_detail_for<'a>(
                 format!("  {}", stripped.trim()),
                 Style::default().fg(TEXT_DIM),
             )));
+        }
+
+        let desc_links = extract_links(desc);
+        if !desc_links.is_empty() {
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "  ── Links ────────────────────────────────────",
+                Style::default().fg(TEXT_MUTED),
+            )));
+            for (text, url) in &desc_links {
+                if text != url {
+                    lines.push(Line::from(Span::styled(
+                        format!("  {text}"),
+                        Style::default().fg(TEXT_DIM),
+                    )));
+                }
+                lines.push(Line::from(Span::styled(
+                    format!("  {url}"),
+                    Style::default().fg(INFO),
+                )));
+            }
         }
     }
 
@@ -1892,6 +1955,16 @@ fn render_calendar_list(f: &mut Frame, app: &mut App, area: Rect) {
     app.calendar_list_state
         .inner
         .select(Some(selected_item_idx));
+
+    // Center the selected item in the viewport on initial load / jump-to-today.
+    if app.calendar_list_state.needs_center {
+        app.calendar_list_state.needs_center = false;
+        // area.height - 2 for borders; estimate ~2 lines per item on average.
+        let visible_items = ((area.height.saturating_sub(2)) / 2) as usize;
+        let half = visible_items / 2;
+        *app.calendar_list_state.inner.offset_mut() = selected_item_idx.saturating_sub(half);
+    }
+
     f.render_stateful_widget(list, area, &mut app.calendar_list_state.inner);
 }
 
@@ -2133,4 +2206,53 @@ fn strip_html(input: &str) -> String {
         .replace("&nbsp;", " ")
         .replace("&#39;", "'")
         .replace("&quot;", "\"")
+}
+
+/// Extract hyperlinks from HTML content. Returns Vec<(text, url)>.
+fn extract_links(html: &str) -> Vec<(String, String)> {
+    let mut links = Vec::new();
+    let mut search = html;
+
+    while let Some(a_start) = search.find("<a ") {
+        let rest = &search[a_start..];
+        // Find the href attribute
+        if let Some(href_pos) = rest.find("href=\"") {
+            let href_start = href_pos + 6;
+            if let Some(href_end) = rest[href_start..].find('"') {
+                let url = &rest[href_start..href_start + href_end];
+                // Find the end of opening tag
+                if let Some(tag_end) = rest.find('>') {
+                    let after_tag = &rest[tag_end + 1..];
+                    // Find closing </a>
+                    let text = if let Some(close) = after_tag.find("</a>") {
+                        strip_html(&after_tag[..close]).trim().to_string()
+                    } else {
+                        String::new()
+                    };
+                    let display = if text.is_empty() {
+                        url.to_string()
+                    } else {
+                        text
+                    };
+                    // Skip anchors and javascript links
+                    if !url.starts_with('#') && !url.starts_with("javascript:") {
+                        links.push((display, url.to_string()));
+                    }
+                    search = if let Some(close) = rest.find("</a>") {
+                        &rest[close + 4..]
+                    } else {
+                        &rest[tag_end + 1..]
+                    };
+                    continue;
+                }
+            }
+        }
+        // Couldn't parse this <a tag, skip past it
+        search = &search[a_start + 3..];
+    }
+
+    // Deduplicate by URL
+    let mut seen = std::collections::HashSet::new();
+    links.retain(|(_, url)| seen.insert(url.clone()));
+    links
 }

@@ -73,6 +73,7 @@ pub fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
                 UnifiedViewMode::CalendarView => {
                     let idx = app.find_today_calendar_idx();
                     app.calendar_list_state.selected = idx;
+                    app.calendar_list_state.needs_center = true;
                 }
                 UnifiedViewMode::ListView => {
                     app.assignment_list_state.selected = 0;
@@ -98,6 +99,10 @@ pub fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
         // Open submission modal for the selected item (works in both view modes).
         KeyCode::Enter if app.active_tab == super::Tab::Assignments => {
             app.open_submission_modal();
+        }
+        // Open submission modal from the dashboard overview.
+        KeyCode::Enter if app.active_tab == super::Tab::Dashboard => {
+            app.open_dashboard_submission_modal();
         }
         KeyCode::Char('t') => {
             app.jump_to_today_active();
