@@ -10,6 +10,7 @@ use super::{App, AssignmentSort, CalendarItem, SubmissionState, Tab, UnifiedView
 use crate::models::Assignment;
 use chrono::{Datelike, Local, NaiveDate, Utc};
 use std::collections::BTreeMap;
+use unicode_width::UnicodeWidthStr;
 
 // ─── Palette ─────────────────────────────────────────────────────────────────
 
@@ -368,17 +369,13 @@ fn render_upcoming_assignments(f: &mut Frame, app: &mut App, area: Rect) {
                     .map(|d| countdown_timer(d))
                     .unwrap_or_default();
 
-                // " ▶ " = 3 chars, timer + trailing space
+                // " ▶ " = 3 display columns, timer + trailing space
                 let prefix_len = 3;
                 let timer_display = format!(" {} ", timer_text);
-                let timer_len = timer_display.len();
+                let timer_len = timer_display.width();
                 let avail = (area.width as usize).saturating_sub(prefix_len + timer_len + 2);
-                let name_trunc = if name.len() > avail {
-                    format!("{}…", &name[..avail.saturating_sub(1)])
-                } else {
-                    name.to_string()
-                };
-                let pad = avail.saturating_sub(name_trunc.len());
+                let name_trunc = truncate_to_width(name, avail);
+                let pad = avail.saturating_sub(name_trunc.width());
 
                 let (marker, marker_fg) = if is_selected {
                     ("▶", AMBER)
@@ -2415,6 +2412,27 @@ fn render_announcements(f: &mut Frame, app: &mut App, area: Rect) {
 }
 
 // ─── Utilities ───────────────────────────────────────────────────────────────
+
+/// Truncate a string to fit within `max_width` display columns, appending "…"
+/// if truncated.  Correctly handles CJK / full-width characters.
+fn truncate_to_width(s: &str, max_width: usize) -> String {
+    let w = s.width();
+    if w <= max_width {
+        return s.to_string();
+    }
+    let target = max_width.saturating_sub(1); // reserve 1 column for "…"
+    let mut cur = 0;
+    let mut end = 0;
+    for (i, ch) in s.char_indices() {
+        let cw = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+        if cur + cw > target {
+            break;
+        }
+        cur += cw;
+        end = i + ch.len_utf8();
+    }
+    format!("{}…", &s[..end])
+}
 
 fn strip_html(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
