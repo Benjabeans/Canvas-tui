@@ -6,7 +6,10 @@ use ratatui::{
     Frame,
 };
 
-use super::{App, AssignmentSort, CalendarItem, SubmissionState, Tab, UnifiedViewMode};
+use super::{
+    assignment_status_priority, is_valid_course_code, App, AssignmentSort, CalendarItem,
+    SubmissionState, Tab, UnifiedViewMode,
+};
 use crate::models::Assignment;
 use chrono::{Datelike, Local, NaiveDate, Utc};
 use std::collections::BTreeMap;
@@ -312,6 +315,7 @@ fn render_upcoming_assignments(f: &mut Frame, app: &mut App, area: Rect) {
     let mut upcoming: Vec<(&str, &Assignment)> = app
         .assignments
         .iter()
+        .filter(|(name, _)| app.course_passes_filter(name))
         .flat_map(|(course, assignments)| assignments.iter().map(move |a| (course.as_str(), a)))
         .filter(|(_, a)| {
             a.due_at
@@ -366,7 +370,7 @@ fn render_upcoming_assignments(f: &mut Frame, app: &mut App, area: Rect) {
 
                 let (timer_text, timer_color) = a
                     .due_at
-                    .map(|d| countdown_timer(d))
+                    .map(countdown_timer)
                     .unwrap_or_default();
 
                 // " ▶ " = 3 display columns, timer + trailing space
@@ -951,9 +955,6 @@ fn render_done_modal(f: &mut Frame, area: Rect, success: bool, message: String) 
     let inner_w = popup.width.saturating_sub(6) as usize;
     let wrapped: Vec<Line> = message
         .chars()
-        .collect::<String>()
-        .as_str()
-        .chars()
         .collect::<Vec<_>>()
         .chunks(inner_w)
         .map(|chunk| {
@@ -1092,45 +1093,137 @@ fn render_course_filter_popup(f: &mut Frame, app: &mut App, area: Rect) {
 fn render_courses(f: &mut Frame, app: &mut App, area: Rect) {
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(38), Constraint::Percentage(62)])
+        .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
         .split(area);
 
-    let items: Vec<ListItem> = app
-        .courses
-        .iter()
-        .enumerate()
-        .map(|(i, course)| {
-            let name = course.name.as_deref().unwrap_or("Unnamed Course");
-            let code = course.course_code.as_deref().unwrap_or("");
-            let students = course
-                .total_students
-                .map(|n| format!("{n} students"))
-                .unwrap_or_default();
+    // Parse course names: before first '-' = course ID, after last '-' = teacher.
+    struct ParsedInfo {
+        course_id: String,
+        teacher: String,
+        details: String,
+    }
 
-            let is_selected = i == app.course_list_state.selected;
-            let (marker, marker_fg) = if is_selected { ("▶", AMBER) } else { ("○", TEXT_MUTED) };
-            let bg = if is_selected { SEL_BG } else { Color::Reset };
+    let mut parsed: Vec<(usize, Option<ParsedInfo>)> = Vec::new();
+    let mut has_uncategorized = false;
 
-            ListItem::new(Line::from(vec![
+    for &course_idx in &app.course_display_order {
+        let course = &app.courses[course_idx];
+        let name = course.name.as_deref().unwrap_or("Unnamed Course");
+        let first_dash = name.find('-');
+        let has_valid_code = first_dash.is_some_and(|d| {
+            is_valid_course_code(name[..d].trim())
+        });
+        if let (Some(first_dash), true) = (first_dash, has_valid_code) {
+            let course_id = name[..first_dash].trim().to_string();
+            let rest = &name[first_dash + 1..];
+            let (details, teacher) = if let Some(last_dash) = rest.rfind('-') {
+                (rest[..last_dash].trim().to_string(), rest[last_dash + 1..].trim().to_string())
+            } else {
+                (rest.trim().to_string(), String::new())
+            };
+            parsed.push((course_idx, Some(ParsedInfo { course_id, teacher, details })));
+        } else {
+            has_uncategorized = true;
+            parsed.push((course_idx, None));
+        }
+    }
+
+    // Compute max column widths for alignment.
+    let max_id_w = parsed.iter()
+        .filter_map(|(_, p)| p.as_ref())
+        .map(|p| p.course_id.width())
+        .max()
+        .unwrap_or(0);
+    let max_teacher_w = parsed.iter()
+        .filter_map(|(_, p)| p.as_ref())
+        .map(|p| p.teacher.width())
+        .max()
+        .unwrap_or(0)
+        .min(20); // cap teacher column width
+
+    // Build list items. Track which absolute row indices are selectable vs header.
+    let mut items: Vec<ListItem> = Vec::new();
+    // Maps selectable index → absolute row index (to sync ratatui scroll).
+    let mut selectable_abs: Vec<usize> = Vec::new();
+    let mut uncategorized_header_inserted = false;
+    let mut selectable_idx = 0;
+
+    for (course_idx, info) in &parsed {
+        let course = &app.courses[*course_idx];
+        let is_current = App::is_current_quarter_course(course);
+
+        // Insert uncategorized header before first uncategorized course.
+        if info.is_none() && !uncategorized_header_inserted && has_uncategorized {
+            uncategorized_header_inserted = true;
+            items.push(ListItem::new(Line::from(vec![
+                Span::styled("   ", Style::default()),
+                Span::styled(
+                    "── Uncategorized ──",
+                    Style::default().fg(TEXT_DIM).add_modifier(Modifier::DIM),
+                ),
+            ])));
+        }
+
+        let is_selected = selectable_idx == app.course_list_state.selected;
+        selectable_abs.push(items.len());
+        selectable_idx += 1;
+
+        let (marker, marker_fg) = if is_selected { ("▶", AMBER) } else { ("○", TEXT_MUTED) };
+        let bg = if is_selected { SEL_BG } else { Color::Reset };
+        let name_fg = if is_current { TEXT } else { TEXT_MUTED };
+        let id_fg = if is_current { AMBER } else { TEXT_MUTED };
+        let teacher_fg = if is_current { AMBER_SOFT } else { TEXT_MUTED };
+
+        let students = course
+            .total_students
+            .map(|n| format!("{n}"))
+            .unwrap_or_default();
+
+        if let Some(info) = info {
+            // Pad columns for alignment.
+            let id_padded = format!("{:<width$}", info.course_id, width = max_id_w);
+            let teacher_padded = format!("{:<width$}", info.teacher, width = max_teacher_w);
+
+            items.push(ListItem::new(Line::from(vec![
                 Span::styled(format!(" {} ", marker), Style::default().fg(marker_fg).bg(bg)),
                 Span::styled(
-                    name,
-                    Style::default()
-                        .fg(TEXT)
-                        .bg(bg)
-                        .add_modifier(if is_selected { Modifier::BOLD } else { Modifier::empty() }),
+                    id_padded,
+                    Style::default().fg(id_fg).bg(bg)
+                        .add_modifier(if is_selected && is_current { Modifier::BOLD } else { Modifier::empty() }),
                 ),
+                Span::styled("  ", Style::default().bg(bg)),
                 Span::styled(
-                    format!("  {}", code),
-                    Style::default().fg(AMBER_SOFT).bg(bg),
+                    teacher_padded,
+                    Style::default().fg(teacher_fg).bg(bg),
                 ),
+                Span::styled("  ", Style::default().bg(bg)),
                 Span::styled(
-                    format!("   {}", students),
+                    format!("{:>3}", students),
                     Style::default().fg(TEXT_MUTED).bg(bg),
                 ),
-            ]))
-        })
-        .collect();
+                Span::styled("  ", Style::default().bg(bg)),
+                Span::styled(
+                    info.details.clone(),
+                    Style::default().fg(name_fg).bg(bg),
+                ),
+            ])));
+        } else {
+            // Uncategorized: show full name.
+            let name = course.name.as_deref().unwrap_or("Unnamed Course");
+            items.push(ListItem::new(Line::from(vec![
+                Span::styled(format!(" {} ", marker), Style::default().fg(marker_fg).bg(bg)),
+                Span::styled(
+                    name.to_string(),
+                    Style::default().fg(name_fg).bg(bg)
+                        .add_modifier(if is_selected && is_current { Modifier::BOLD } else { Modifier::empty() }),
+                ),
+                Span::styled(
+                    format!("  {:>3}", students),
+                    Style::default().fg(TEXT_MUTED).bg(bg),
+                ),
+            ])));
+        }
+    }
 
     let list = List::new(items).block(
         Block::default()
@@ -1141,7 +1234,12 @@ fn render_courses(f: &mut Frame, app: &mut App, area: Rect) {
             .title_style(Style::default().fg(AMBER).add_modifier(Modifier::BOLD)),
     );
 
-    app.course_list_state.inner.select(Some(app.course_list_state.selected));
+    // Map the logical selection to the absolute row index (skipping header rows).
+    let abs_idx = selectable_abs
+        .get(app.course_list_state.selected)
+        .copied()
+        .unwrap_or(0);
+    app.course_list_state.inner.select(Some(abs_idx));
     f.render_stateful_widget(list, chunks[0], &mut app.course_list_state.inner);
 
     render_course_detail(f, app, chunks[1]);
@@ -1153,8 +1251,7 @@ fn render_courses(f: &mut Frame, app: &mut App, area: Rect) {
 
 fn render_course_detail(f: &mut Frame, app: &App, area: Rect) {
     let course_name = app
-        .courses
-        .get(app.course_list_state.selected)
+        .selected_course()
         .and_then(|c| c.name.as_deref())
         .unwrap_or("Course");
 
@@ -1425,7 +1522,7 @@ fn assignment_status(a: &Assignment) -> (String, Color) {
             }
             Some("submitted") => ("Submitted".into(), INFO),
             _ => {
-                if a.due_at.map_or(false, |d| d < now) {
+                if a.due_at.is_some_and(|d| d < now) {
                     if sub.missing.unwrap_or(false) {
                         ("Missing!".into(), DANGER)
                     } else {
@@ -1436,31 +1533,10 @@ fn assignment_status(a: &Assignment) -> (String, Color) {
                 }
             }
         }
-    } else if a.due_at.map_or(false, |d| d < now) {
+    } else if a.due_at.is_some_and(|d| d < now) {
         ("Past due".into(), CAUTION)
     } else {
         ("─".into(), TEXT_MUTED)
-    }
-}
-
-fn assignment_status_priority(a: &Assignment) -> u8 {
-    let now = Utc::now();
-    if let Some(ref sub) = a.submission {
-        match sub.workflow_state.as_deref() {
-            Some("graded") => 4,
-            Some("submitted") => 3,
-            _ => {
-                if a.due_at.map_or(false, |d| d < now) {
-                    if sub.missing.unwrap_or(false) { 0 } else { 1 }
-                } else {
-                    2
-                }
-            }
-        }
-    } else if a.due_at.map_or(false, |d| d < now) {
-        1
-    } else {
-        2
     }
 }
 

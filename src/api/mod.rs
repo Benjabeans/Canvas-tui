@@ -163,11 +163,6 @@ impl CanvasClient {
         .await
     }
 
-    pub async fn get_course(&self, course_id: u64) -> Result<Course, CanvasError> {
-        let resp = self.get(&format!("/courses/{course_id}")).await?;
-        Ok(resp.json().await?)
-    }
-
     // ── Pages ────────────────────────────────────────────────────────────
 
     pub async fn list_pages(&self, course_id: u64) -> Result<Vec<Page>, CanvasError> {
@@ -183,27 +178,6 @@ impl CanvasClient {
             .get(&format!("/courses/{course_id}/pages/{page_url}"))
             .await?;
         Ok(resp.json().await?)
-    }
-
-    // ── Grades ──────────────────────────────────────────────────────────
-
-    pub fn extract_grades(&self, courses: &[Course]) -> Vec<CourseGrade> {
-        courses
-            .iter()
-            .filter_map(|c| {
-                let enrollment = c.enrollments.as_ref()?.iter().find(|e| {
-                    e.enrollment_type.as_deref() == Some("student")
-                })?;
-                Some(CourseGrade {
-                    course_id: c.id,
-                    course_name: c.name.clone().unwrap_or_else(|| "Unnamed".into()),
-                    current_score: enrollment.computed_current_score,
-                    current_grade: enrollment.computed_current_grade.clone(),
-                    final_score: enrollment.computed_final_score,
-                    final_grade: enrollment.computed_final_grade.clone(),
-                })
-            })
-            .collect()
     }
 
     // ── Assignments ─────────────────────────────────────────────────────
@@ -222,32 +196,6 @@ impl CanvasClient {
         }
         self.get_all_pages(&format!("/courses/{course_id}/assignments"), &params)
             .await
-    }
-
-    pub async fn get_assignment(
-        &self,
-        course_id: u64,
-        assignment_id: u64,
-    ) -> Result<Assignment, CanvasError> {
-        let resp = self
-            .get(&format!(
-                "/courses/{course_id}/assignments/{assignment_id}"
-            ))
-            .await?;
-        Ok(resp.json().await?)
-    }
-
-    // ── Submissions ─────────────────────────────────────────────────────
-
-    pub async fn list_my_submissions(
-        &self,
-        course_id: u64,
-    ) -> Result<Vec<Submission>, CanvasError> {
-        self.get_all_pages(
-            &format!("/courses/{course_id}/students/submissions"),
-            &[("student_ids[]", "self"), ("per_page", "50")],
-        )
-        .await
     }
 
     // ── Calendar ────────────────────────────────────────────────────────
@@ -302,19 +250,6 @@ impl CanvasClient {
             params.push(("context_codes[]", code));
         }
         self.get_all_pages("/announcements", &params).await
-    }
-
-    // ── Discussion Topics ───────────────────────────────────────────────
-
-    pub async fn list_discussions(
-        &self,
-        course_id: u64,
-    ) -> Result<Vec<DiscussionTopic>, CanvasError> {
-        self.get_all_pages(
-            &format!("/courses/{course_id}/discussion_topics"),
-            &[("per_page", "25")],
-        )
-        .await
     }
 
     // ── User / Profile ──────────────────────────────────────────────────

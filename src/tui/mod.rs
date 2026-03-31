@@ -4,10 +4,137 @@ pub mod ui;
 use crate::api::CanvasClient;
 use crate::cache::{save_cache, CacheData};
 use crate::models::*;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Datelike, Local, Utc};
 use ratatui::widgets::ListState as RListState;
 use std::collections::HashSet;
 use tokio::sync::oneshot;
+
+// ─── Academic Quarter Utilities ──────────────────────────────────────────────
+
+/// An academic quarter: season + two-digit year.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct AcademicQuarter {
+    /// Canonical ordinal: year * 10 + season_index.
+    /// WI=0, SP=1, SU=2, FA=3 (calendar order within an academic year).
+    ordinal: u32,
+}
+
+impl AcademicQuarter {
+    fn new(season: &str, year_2digit: u32) -> Self {
+        let season_idx = match season {
+            "WI" => 0,
+            "SP" => 1,
+            "SU" => 2,
+            "FA" => 3,
+            _ => 0,
+        };
+        Self {
+            ordinal: year_2digit * 10 + season_idx,
+        }
+    }
+
+    /// Determine the current academic quarter from today's date.
+    fn current() -> Self {
+        let now = Local::now();
+        let month = now.month();
+        let year_2digit = (now.year() % 100) as u32;
+        let season = match month {
+            1..=3 => "WI",
+            4..=6 => "SP",
+            7..=8 => "SU",
+            _ => "FA", // 9..=12
+        };
+        Self::new(season, year_2digit)
+    }
+}
+
+/// Try to extract an academic quarter code (e.g. "FA25", "WI26") from a string.
+/// Searches for patterns like FA25, WI26, SP25, SU25 (case-insensitive).
+fn parse_quarter(s: &str) -> Option<AcademicQuarter> {
+    let upper = s.to_uppercase();
+    let prefixes = ["FA", "WI", "SP", "SU"];
+    for prefix in &prefixes {
+        if let Some(pos) = upper.find(prefix) {
+            let after = &upper[pos + 2..];
+            // Next two chars must be digits.
+            if after.len() >= 2 {
+                if let Ok(year) = after[..2].parse::<u32>() {
+                    return Some(AcademicQuarter::new(prefix, year));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Check if a course (by name and code) belongs to the current academic quarter.
+/// Returns `None` if no quarter could be parsed (treat as current).
+fn course_quarter(name: Option<&str>, code: Option<&str>) -> Option<AcademicQuarter> {
+    code.and_then(parse_quarter)
+        .or_else(|| name.and_then(parse_quarter))
+}
+
+// ─── Assignment Status Priority ──────────────────────────────────────────────
+
+/// Returns a numeric priority for assignment status (lower = more urgent):
+///   0 = missing, 1 = past due, 2 = upcoming/not submitted, 3 = submitted, 4 = graded.
+pub fn assignment_status_priority(a: &Assignment) -> u8 {
+    let now = chrono::Utc::now();
+    if let Some(ref sub) = a.submission {
+        match sub.workflow_state.as_deref() {
+            Some("graded") => 4,
+            Some("submitted") => 3,
+            _ => {
+                if a.due_at.is_some_and(|d| d < now) {
+                    if sub.missing.unwrap_or(false) { 0 } else { 1 }
+                } else {
+                    2
+                }
+            }
+        }
+    } else if a.due_at.is_some_and(|d| d < now) {
+        1
+    } else {
+        2
+    }
+}
+
+// ─── Course Code Validation ──────────────────────────────────────────────────
+
+/// Check if a string looks like a valid course code: one or more letters
+/// followed by one or more digits, optionally followed by a single letter.
+/// Examples: "CS101", "MATH200", "ENG101B", "CS 142" (spaces allowed between parts).
+pub fn is_valid_course_code(s: &str) -> bool {
+    let s = s.replace(' ', "");
+    if s.is_empty() {
+        return false;
+    }
+    let mut chars = s.chars().peekable();
+    // Must start with at least one letter.
+    let mut has_alpha = false;
+    while chars.peek().is_some_and(|c| c.is_ascii_alphabetic()) {
+        has_alpha = true;
+        chars.next();
+    }
+    if !has_alpha {
+        return false;
+    }
+    // Must have at least one digit.
+    let mut has_digit = false;
+    while chars.peek().is_some_and(|c| c.is_ascii_digit()) {
+        has_digit = true;
+        chars.next();
+    }
+    if !has_digit {
+        return false;
+    }
+    // Optional trailing letter (section indicator like 'B').
+    if chars.peek().is_some_and(|c| c.is_ascii_alphabetic()) {
+        chars.next();
+    }
+    // Nothing else should remain.
+    chars.next().is_none()
+}
 
 // ─── Submission ──────────────────────────────────────────────────────────────
 
@@ -238,6 +365,10 @@ pub struct App {
     pub launch_editor: bool,
     pub submission_rx: Option<oneshot::Receiver<SubmitResult>>,
 
+    // Display-order mapping: display position → index into `self.courses`.
+    // Categorized courses first, then uncategorized (no dash pattern).
+    pub course_display_order: Vec<usize>,
+
     // Course pages picker & detail
     pub course_pages: Vec<crate::models::Page>,
     pub show_course_pages_picker: bool,
@@ -333,6 +464,7 @@ impl App {
             submission_target: None,
             launch_editor: false,
             submission_rx: None,
+            course_display_order: Vec::new(),
             course_pages: Vec::new(),
             show_course_pages_picker: false,
             course_pages_list_state: ListState::new(),
@@ -349,8 +481,8 @@ impl App {
     /// network requests.  After this call the UI is immediately usable.
     pub fn load_from_cache(&mut self, cache: CacheData) {
         self.user = cache.user;
-        self.course_list_state.set_len(cache.courses.len());
         self.courses = cache.courses;
+        self.rebuild_course_display_order();
 
         self.assignments = cache.assignments;
         self.recount_filtered_assignments();
@@ -459,8 +591,8 @@ impl App {
 
         // Success (or partial success with no cached fallback) — apply fresh data.
         self.user = result.user;
-        self.course_list_state.set_len(result.courses.len());
         self.courses = result.courses;
+        self.rebuild_course_display_order();
 
         self.assignments = result.assignments;
         self.recount_filtered_assignments();
@@ -509,9 +641,27 @@ impl App {
             .filter_map(|e| e.assignment.as_ref().and_then(|a| a.id))
             .collect();
 
+        // Build a set of current-quarter course IDs for filtering calendar events.
+        let current_course_ids: HashSet<u64> = self
+            .courses
+            .iter()
+            .filter(|c| Self::is_current_quarter_course(c))
+            .map(|c| c.id)
+            .collect();
+
         let mut items: Vec<CalendarItem> = self
             .calendar_events
             .iter()
+            .filter(|e| {
+                // Keep events whose context_code matches a current-quarter course,
+                // or events with no context_code (keep by default).
+                e.context_code
+                    .as_deref()
+                    .and_then(|cc| cc.strip_prefix("course_"))
+                    .and_then(|id| id.parse::<u64>().ok())
+                    .map(|id| current_course_ids.contains(&id))
+                    .unwrap_or(true)
+            })
             .map(|e| CalendarItem {
                 start_at: e.start_at,
                 title: e.title.clone().unwrap_or_else(|| "Untitled".into()),
@@ -526,8 +676,8 @@ impl App {
             })
             .collect();
 
-        // Merge in assignment due dates not already present.
-        for (course_name, assignments) in &self.assignments {
+        // Merge in assignment due dates not already present (current quarter only).
+        for (course_name, assignments) in self.assignments.iter().filter(|(name, _)| self.is_current_quarter_by_name(name)) {
             for assignment in assignments {
                 if assignment.due_at.is_none() {
                     continue;
@@ -551,7 +701,7 @@ impl App {
                         ),
                         Some("submitted") => Some("Submitted".into()),
                         _ => {
-                            if assignment.due_at.map_or(false, |d| d < now) {
+                            if assignment.due_at.is_some_and(|d| d < now) {
                                 if sub.missing.unwrap_or(false) {
                                     Some("Missing!".into())
                                 } else {
@@ -562,7 +712,7 @@ impl App {
                             }
                         }
                     }
-                } else if assignment.due_at.map_or(false, |d| d < now) {
+                } else if assignment.due_at.is_some_and(|d| d < now) {
                     Some("Past due".into())
                 } else {
                     None
@@ -695,26 +845,7 @@ impl App {
                 (Some(x), Some(y)) => y.cmp(&x),
             }),
             AssignmentSort::Status => {
-                flat.sort_by_key(|(_, a)| {
-                    let now = chrono::Utc::now();
-                    if let Some(ref sub) = a.submission {
-                        match sub.workflow_state.as_deref() {
-                            Some("graded") => 4u8,
-                            Some("submitted") => 3,
-                            _ => {
-                                if a.due_at.map_or(false, |d| d < now) {
-                                    if sub.missing.unwrap_or(false) { 0 } else { 1 }
-                                } else {
-                                    2
-                                }
-                            }
-                        }
-                    } else if a.due_at.map_or(false, |d| d < now) {
-                        1
-                    } else {
-                        2
-                    }
-                });
+                flat.sort_by_key(|(_, a)| assignment_status_priority(a));
             }
             AssignmentSort::Course => { /* already in course order */ }
         }
@@ -738,20 +869,41 @@ impl App {
         self.assignments.iter().map(|(name, _)| name.as_str()).collect()
     }
 
-    /// Returns true if the given course name passes the current filter.
-    /// An empty filter set means "show all".
+    /// Returns true if the given course name passes the current filter
+    /// AND belongs to the current academic quarter.
+    /// An empty filter set means "show all (current quarter)".
     pub fn course_passes_filter(&self, course_name: &str) -> bool {
-        self.course_filter.is_empty() || self.course_filter.contains(course_name)
+        let filter_ok = self.course_filter.is_empty() || self.course_filter.contains(course_name);
+        filter_ok && self.is_current_quarter_by_name(course_name)
     }
 
-    /// Toggle a course in the filter set.
-    pub fn toggle_course_filter(&mut self, course_name: &str) {
-        if self.course_filter.contains(course_name) {
-            self.course_filter.remove(course_name);
-        } else {
-            self.course_filter.insert(course_name.to_string());
+    /// Check if a course (by display name) belongs to the current quarter.
+    /// Looks up the course in `self.courses` to also check `course_code`.
+    /// Courses with no detectable quarter code are treated as current.
+    fn is_current_quarter_by_name(&self, course_name: &str) -> bool {
+        let current = AcademicQuarter::current();
+        // Find the matching course to get the code too.
+        let course = self.courses.iter().find(|c| {
+            c.name.as_deref() == Some(course_name)
+        });
+        let q = match course {
+            Some(c) => course_quarter(c.name.as_deref(), c.course_code.as_deref()),
+            None => parse_quarter(course_name),
+        };
+        match q {
+            Some(q) => q == current,
+            None => true, // no quarter detected — treat as current
         }
-        self.recount_filtered_assignments();
+    }
+
+    /// Check if a `Course` struct is from the current academic quarter.
+    /// Courses with no detectable quarter code are treated as current.
+    pub fn is_current_quarter_course(course: &Course) -> bool {
+        let current = AcademicQuarter::current();
+        match course_quarter(course.name.as_deref(), course.course_code.as_deref()) {
+            Some(q) => q == current,
+            None => true,
+        }
     }
 
     /// Recount visible assignments after filter change and clamp selection.
@@ -775,6 +927,7 @@ impl App {
         let mut upcoming: Vec<(&str, &Assignment)> = self
             .assignments
             .iter()
+            .filter(|(name, _)| self.is_current_quarter_by_name(name))
             .flat_map(|(course, assignments)| {
                 assignments.iter().map(move |a| (course.as_str(), a))
             })
@@ -963,7 +1116,7 @@ impl App {
 
     /// Fetch the list of available pages for the currently selected course.
     pub fn fetch_course_pages(&mut self) {
-        let Some(course) = self.courses.get(self.course_list_state.selected) else {
+        let Some(course) = self.selected_course() else {
             return;
         };
         let course_id = course.id;
@@ -1018,7 +1171,7 @@ impl App {
             self.status_message = "Page has no URL.".into();
             return;
         };
-        let Some(course) = self.courses.get(self.course_list_state.selected) else {
+        let Some(course) = self.selected_course() else {
             return;
         };
         let course_id = course.id;
@@ -1059,6 +1212,38 @@ impl App {
             result.unwrap_or_else(|| "No Details Found".into()),
         );
         true
+    }
+
+    /// Rebuild the display order for the courses list.
+    /// Categorized courses (valid course code before first '-') come first,
+    /// uncategorized at the bottom.
+    pub fn rebuild_course_display_order(&mut self) {
+        let mut categorized = Vec::new();
+        let mut uncategorized = Vec::new();
+        for (i, course) in self.courses.iter().enumerate() {
+            let name = course.name.as_deref().unwrap_or("");
+            let has_valid_code = name.find('-').is_some_and(|dash| {
+                is_valid_course_code(name[..dash].trim())
+            });
+            if has_valid_code {
+                categorized.push(i);
+            } else {
+                uncategorized.push(i);
+            }
+        }
+        categorized.extend(uncategorized);
+        self.course_display_order = categorized;
+        self.course_list_state.set_len(self.courses.len());
+    }
+
+    /// Get the actual course index for the currently selected display position.
+    pub fn selected_course_idx(&self) -> Option<usize> {
+        self.course_display_order.get(self.course_list_state.selected).copied()
+    }
+
+    /// Get a reference to the currently selected course.
+    pub fn selected_course(&self) -> Option<&Course> {
+        self.selected_course_idx().and_then(|i| self.courses.get(i))
     }
 
     pub fn active_list_state_mut(&mut self) -> &mut ListState {

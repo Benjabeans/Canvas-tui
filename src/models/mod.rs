@@ -126,18 +126,6 @@ pub struct User {
     pub avatar_url: Option<String>,
 }
 
-// ─── Grades ─────────────────────────────────────────────────────────────────
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CourseGrade {
-    pub course_id: u64,
-    pub course_name: String,
-    pub current_score: Option<f64>,
-    pub current_grade: Option<String>,
-    pub final_score: Option<f64>,
-    pub final_grade: Option<String>,
-}
-
 // ─── Pages ──────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
