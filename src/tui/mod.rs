@@ -34,17 +34,29 @@ impl AcademicQuarter {
     }
 
     /// Determine the current academic quarter from today's date.
+    /// Uses approximate UCSD quarter start dates, activating 1 week early:
+    ///   Winter ~Jan 6   → active from Dec 30
+    ///   Spring ~Mar 31  → active from Mar 24
+    ///   Summer ~Jul 1   → active from Jun 24
+    ///   Fall   ~Sep 28  → active from Sep 21
     fn current() -> Self {
         let now = Local::now();
-        let month = now.month();
+        let md = (now.month(), now.day());
         let year_2digit = (now.year() % 100) as u32;
-        let season = match month {
-            1..=3 => "WI",
-            4..=6 => "SP",
-            7..=8 => "SU",
-            _ => "FA", // 9..=12
+
+        let (season, yr) = if md >= (12, 30) {
+            ("WI", year_2digit + 1)
+        } else if md >= (9, 21) {
+            ("FA", year_2digit)
+        } else if md >= (6, 24) {
+            ("SU", year_2digit)
+        } else if md >= (3, 24) {
+            ("SP", year_2digit)
+        } else {
+            ("WI", year_2digit)
         };
-        Self::new(season, year_2digit)
+
+        Self::new(season, yr)
     }
 }
 
